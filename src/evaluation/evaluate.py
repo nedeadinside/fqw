@@ -1,40 +1,95 @@
+"""
+Пайплайн оценки: загрузка модели → генерация SQL → вычисление метрик.
+
+Запуск:
+    python -m src.evaluation.evaluate \\
+        --model_path results/checkpoints/E2/best \\
+        --split test \\
+        --experiment E2 \\
+        [--config configs/training_config.yaml]
+
+Поддерживаемые сплиты:
+    val                  — validation (50% dev Spider + 50% dev BIRD)
+    test                 — test (оставшиеся 50% dev)
+    test_spider_held_out — Spider held-out test set (2 147 примеров)
+
+Baseline режимы (без модели, через --baseline):
+    zero_shot  — E0-ZS: zero-shot промпт без кастомных токенов
+    few_shot   — E0-FS: 3-shot in-context learning
+"""
+
 from __future__ import annotations
 
 import argparse
 import json
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
-import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.data.dataset import (
     CUSTOM_SPECIAL_TOKENS,
     SYSTEM_PROMPT,
-    apply_project_chat_template,
     build_db_path_index,
     load_jsonl,
     stratified_dev_split,
 )
 from src.evaluation.metrics import compute_all_metrics
 
-EXPERIMENT_ID = "E2"
 
+# ---------------------------------------------------------------------------
+# Формирование промптов для инференса
+# ---------------------------------------------------------------------------
 
-def make_inference_prompt(example: dict, tokenizer) -> str:
+def make_inference_prompt(example: dict, tokenizer, use_custom_tokens: bool = True) -> str:
+    """Формирует промпт для инференса (без assistant-ответа).
+
+    Формат тегов одинаков для E1-E5: <schema>/<question>.
+    Разница в том, добавлены ли эти теги в словарь токенизатора:
+      - use_custom_tokens=True  (E1-E3, E5): каждый тег = 1 специальный токен
+      - use_custom_tokens=False (E0-ZS, E4): теги как plain text → подтокены
+    Для E0-ZS токенизатор вообще не знает этих тегов, но формат тот же —
+    модель просто видит их как обычные символы.
+    """
+    user_content = (
+        f"<schema>\n{example['schema']}\n</schema>\n\n"
+        f"<question>\n{example['question']}\n</question>"
+    )
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": {
-                "schema": example["schema"],
-                "question": example["question"],
-            },
-        },
+        {"role": "user", "content": user_content},
     ]
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,  # добавляет <|im_start|>assistant\n
+    )
+
+
+def make_few_shot_prompt(
+    example: dict,
+    few_shot_examples: List[dict],
+    tokenizer,
+) -> str:
+    """3-shot промпт для E0-FS."""
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    for fs_ex in few_shot_examples:
+        messages.append({
+            "role": "user",
+            "content": f"Schema:\n{fs_ex['schema']}\n\nQuestion: {fs_ex['question']}",
+        })
+        messages.append({"role": "assistant", "content": fs_ex["sql"]})
+
+    messages.append({
+        "role": "user",
+        "content": f"Schema:\n{example['schema']}\n\nQuestion: {example['question']}",
+    })
+
     return tokenizer.apply_chat_template(
         messages,
         tokenize=False,
@@ -42,266 +97,435 @@ def make_inference_prompt(example: dict, tokenizer) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Извлечение SQL из сгенерированного текста
+# ---------------------------------------------------------------------------
+
 def extract_sql(generated_text: str, prompt: str) -> str:
+    """Извлекает SQL из полного вывода модели.
+
+    Отрезает промпт, берёт текст до первого <|im_end|>.
+    Дополнительно обрезает markdown-обёртку ```sql ... ```.
+    """
+    # Убираем промпт из начала
     if generated_text.startswith(prompt):
-        sql_text = generated_text[len(prompt) :]
+        sql = generated_text[len(prompt):]
     else:
-        sql_text = generated_text
+        sql = generated_text
 
-    for stop_token in ["<|im_end|>", "<|endoftext|>", "</s>"]:
-        if stop_token in sql_text:
-            sql_text = sql_text[: sql_text.index(stop_token)]
+    # Обрезаем по end-of-turn токену
+    for stop in ["<|im_end|>", "<|endoftext|>", "</s>"]:
+        if stop in sql:
+            sql = sql[:sql.index(stop)]
 
-    sql_text = sql_text.strip()
+    sql = sql.strip()
 
-    if sql_text.startswith("```"):
-        lines = sql_text.split("\n")
+    # Убираем markdown-блок ```sql ... ``` если модель его добавила
+    if sql.startswith("```"):
+        lines = sql.split("\n")
+        # Пропускаем первую строку (```sql или ```)
         inner = lines[1:]
+        # Убираем последний ``` если есть
         if inner and inner[-1].strip().startswith("```"):
             inner = inner[:-1]
-        sql_text = "\n".join(inner).strip()
+        sql = "\n".join(inner).strip()
 
-    return sql_text
+    return sql
 
+
+# ---------------------------------------------------------------------------
+# Генерация SQL для списка примеров
+# ---------------------------------------------------------------------------
 
 def generate_predictions(
     records: List[dict],
     model,
     tokenizer,
+    use_custom_tokens: bool = True,
+    few_shot_examples: Optional[List[dict]] = None,
     max_new_tokens: int = 512,
     batch_size: int = 4,
     source_label: Optional[str] = None,
 ) -> List[dict]:
+    """Генерирует SQL-предсказания для списка примеров.
+
+    Args:
+        records: список JSONL-записей
+        model: загруженная модель (PeftModel или AutoModelForCausalLM)
+        tokenizer: токенизатор
+        use_custom_tokens: использовать ли кастомные теги в промпте
+        few_shot_examples: если задано — использовать few-shot формат
+        max_new_tokens: максимальная длина генерируемого SQL
+        batch_size: батч для инференса
+        source_label: "spider" | "bird" для метаданных предсказания
+
+    Returns:
+        Список dict с полями: example_id, db_id, question, predicted_sql, gold_sql, source
+    """
     model.eval()
 
     eos_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-    generation_config = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": False,
-        "num_beams": 1,
-        "temperature": 1.0,
-        "repetition_penalty": 1.1,
-        "eos_token_id": eos_token_id,
-        "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
-    }
 
-    predictions: List[dict] = []
+    generation_config = dict(
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        num_beams=1,
+        temperature=1.0,
+        repetition_penalty=1.1,
+        eos_token_id=eos_token_id,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+    )
+
+    predictions = []
     total = len(records)
 
-    for start in range(0, total, batch_size):
-        batch = records[start : start + batch_size]
-        prompts = [make_inference_prompt(record, tokenizer) for record in batch]
+    for i in range(0, total, batch_size):
+        batch = records[i : i + batch_size]
+        prompts = []
+        for ex in batch:
+            if few_shot_examples:
+                prompt = make_few_shot_prompt(ex, few_shot_examples, tokenizer)
+            else:
+                prompt = make_inference_prompt(ex, tokenizer, use_custom_tokens)
+            prompts.append(prompt)
 
         inputs = tokenizer(
             prompts,
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=3072,
+            max_length=3072,  # оставляем место для генерации
         ).to(model.device)
 
         with torch.no_grad():
             outputs = model.generate(**inputs, **generation_config)
 
+        # Декодируем только новые токены
         input_lengths = inputs["input_ids"].shape[1]
         generated_ids = outputs[:, input_lengths:]
         decoded = tokenizer.batch_decode(generated_ids, skip_special_tokens=False)
 
-        for index, (record, text_output, prompt) in enumerate(
-            zip(batch, decoded, prompts)
-        ):
-            _ = prompt
-            sql_text = extract_sql(text_output, "")
-            predictions.append(
-                {
-                    "example_id": record.get("example_id", f"{start + index}"),
-                    "db_id": record["db_id"],
-                    "question": record["question"],
-                    "predicted_sql": sql_text,
-                    "gold_sql": record["sql"],
-                    "source": source_label or infer_source(record),
-                    "complexity": record.get("complexity", "unknown"),
-                }
-            )
+        for j, (ex, gen_text, prompt) in enumerate(zip(batch, decoded, prompts)):
+            sql = extract_sql(gen_text, "")  # промпт уже отрезан через slicing
+            pred = {
+                "example_id": ex.get("example_id", f"{i+j}"),
+                "db_id": ex["db_id"],
+                "question": ex["question"],
+                "predicted_sql": sql,
+                "gold_sql": ex["sql"],
+                "source": source_label or _infer_source(ex),
+                "complexity": ex.get("complexity", "unknown"),
+            }
+            predictions.append(pred)
 
-        if (start // batch_size) % 10 == 0:
-            print(f"[eval] {start + len(batch)}/{total}")
+        if (i // batch_size) % 10 == 0:
+            print(f"  [{i+len(batch)}/{total}] примеров обработано")
 
     return predictions
 
 
-def infer_source(example: dict) -> str:
+def _infer_source(example: dict) -> str:
+    """Определяет источник примера по полю source (предпочтительно) или example_id (legacy)."""
     source = example.get("source", "")
     if source in ("spider", "bird"):
         return source
     return "unknown"
 
 
-def load_model_for_inference(model_path: str):
-    from peft import PeftModel
+# ---------------------------------------------------------------------------
+# Загрузка модели для инференса
+# ---------------------------------------------------------------------------
+
+def load_model_for_inference(
+    model_path: str,
+    use_custom_tokens: bool = True,
+    load_in_4bit: bool = False,
+):
+    """Загружает дообученную модель (base + LoRA adapter или merged).
+
+    Args:
+        model_path: путь к директории с сохранённой моделью
+        use_custom_tokens: добавить ли кастомные токены в токенизатор
+        load_in_4bit: загружать ли в 4-bit (для инференса на ограниченной GPU)
+    """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    tokenizer = apply_project_chat_template(tokenizer)
-    tokenizer.add_special_tokens({"additional_special_tokens": CUSTOM_SPECIAL_TOKENS})
 
-    load_kwargs = {
+    if use_custom_tokens:
+        num_added = tokenizer.add_special_tokens(
+            {"additional_special_tokens": CUSTOM_SPECIAL_TOKENS}
+        )
+        # Если токены уже были сохранены с моделью — num_added = 0, это нормально
+        print(f"[inference] Кастомных токенов добавлено/найдено: {num_added}")
+
+    load_kwargs: dict = {
         "trust_remote_code": True,
         "device_map": "auto",
-        "torch_dtype": torch.bfloat16,
     }
 
-    adapter_config = Path(model_path) / "adapter_config.json"
-    if adapter_config.exists():
-        config_data = json.loads(adapter_config.read_text(encoding="utf-8"))
-        base_model_name = config_data["base_model_name_or_path"]
-        base_model = AutoModelForCausalLM.from_pretrained(
-            base_model_name, **load_kwargs
-        )
-        base_model.resize_token_embeddings(len(tokenizer))
-        model = PeftModel.from_pretrained(base_model, model_path)
+    if load_in_4bit:
+        from src.training.lora_config import get_bnb_config
+        load_kwargs["quantization_config"] = get_bnb_config()
+        load_kwargs["torch_dtype"] = torch.bfloat16
     else:
+        load_kwargs["torch_dtype"] = torch.bfloat16
+
+    # Пробуем загрузить как PeftModel (если это LoRA adapter)
+    try:
+        from peft import PeftModel
+        # Ищем config.json — если это merged модель, там нет adapter_config.json
+        adapter_config = Path(model_path) / "adapter_config.json"
+        if adapter_config.exists():
+            base_model_name = json.loads(adapter_config.read_text())["base_model_name_or_path"]
+            base = AutoModelForCausalLM.from_pretrained(base_model_name, **load_kwargs)
+            base.resize_token_embeddings(len(tokenizer))
+            model = PeftModel.from_pretrained(base, model_path)
+            print(f"[inference] Загружена PeftModel (LoRA adapter) из {model_path}")
+        else:
+            model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+            print(f"[inference] Загружена merged модель из {model_path}")
+    except Exception:
         model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+        print(f"[inference] Загружена модель из {model_path}")
 
     model.eval()
     return model, tokenizer
 
 
-def build_complexity_lookup(json_path: Path, field: str) -> dict:
-    if not json_path.exists():
-        return {}
-    try:
-        with open(json_path, encoding="utf-8") as file_obj:
-            examples = json.load(file_obj)
-    except Exception:
-        return {}
-    return {
-        index: example.get(field, "unknown") for index, example in enumerate(examples)
-    }
-
-
-def resolve_model_path(config: dict, model_path: Optional[str]) -> str:
-    if model_path:
-        return model_path
-    return str(Path(config["output_dir"]) / EXPERIMENT_ID / "best")
-
+# ---------------------------------------------------------------------------
+# Оркестратор оценки
+# ---------------------------------------------------------------------------
 
 def evaluate(
-    model_path: Optional[str],
+    model_path: str,
     split: str,
     config_path: str,
+    experiment_id: str,
     batch_size: int = 4,
     max_new_tokens: int = 512,
+    baseline_mode: Optional[str] = None,
     output_dir: str = "results",
 ):
-    with open(config_path, encoding="utf-8") as file_obj:
-        config = yaml.safe_load(file_obj)
+    """Полный пайплайн оценки.
 
-    data_dir = Path(config["processed_data_dir"])
+    Args:
+        model_path:   путь к дообученной модели (или None для baseline)
+        split:        "val" | "test" | "test_spider_held_out"
+        config_path:  путь к training_config.yaml
+        experiment_id: "E0-ZS" | "E0-FS" | "E1" | "E2" | "E3" | "E4" | "E5"
+        batch_size:   батч инференса
+        max_new_tokens: максимальная длина SQL
+        baseline_mode: "zero_shot" | "few_shot" | None (fine-tuned)
+        output_dir:   директория для сохранения результатов
+    """
+    import yaml
 
-    spider_complexity = build_complexity_lookup(
-        Path(config["spider_db_dir"]).parent / "dev.json", "hardness"
-    )
-    bird_complexity = build_complexity_lookup(
-        Path(config["bird_dev_db_dir"]).parent / "dev.json", "difficulty"
-    )
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
 
+    data_dir = Path(cfg["processed_data_dir"])
+    use_custom_tokens = (baseline_mode is None) and (experiment_id != "E4")
+
+    # --- Словари complexity из оригинальных JSON (для JSONL без этого поля) ---
+    spider_complexity: dict = {}
+    bird_complexity: dict = {}
+    try:
+        spider_complexity = _build_complexity_lookup(
+            Path(cfg["spider_db_dir"]).parent / "dev.json", "hardness"
+        )
+        bird_complexity = _build_complexity_lookup(
+            Path(cfg["bird_dev_db_dir"]).parent / "dev.json", "difficulty"
+        )
+    except Exception:
+        pass
+
+    # --- Загрузка примеров для выбранного сплита ---
     if split == "test_spider_held_out":
         records = load_jsonl(data_dir / "spider_test.jsonl")
-        for record in records:
-            record.setdefault("source", "spider")
+        for r in records:
+            r.setdefault("source", "spider")
         source_label = "spider"
     else:
         spider_dev = load_jsonl(data_dir / "spider_dev.jsonl")
         bird_dev = load_jsonl(data_dir / "bird_dev.jsonl")
 
-        for record in spider_dev:
-            record.setdefault("source", "spider")
-            record.setdefault(
-                "complexity", spider_complexity.get(record["example_id"], "unknown")
-            )
-        for record in bird_dev:
-            record.setdefault("source", "bird")
-            record.setdefault(
-                "complexity", bird_complexity.get(record["example_id"], "unknown")
-            )
+        # Inject source и complexity (для JSONL без этих полей)
+        for r in spider_dev:
+            r.setdefault("source", "spider")
+            r.setdefault("complexity", spider_complexity.get(r["example_id"], "unknown"))
+        for r in bird_dev:
+            r.setdefault("source", "bird")
+            r.setdefault("complexity", bird_complexity.get(r["example_id"], "unknown"))
 
         spider_val, spider_test = stratified_dev_split(spider_dev)
         bird_val, bird_test = stratified_dev_split(bird_dev)
 
         if split == "val":
             records = spider_val + bird_val
-        else:
+        else:  # "test"
             records = spider_test + bird_test
-        source_label = None
+        source_label = None  # определяется per-example через поле source
 
-    print(f"[eval] split={split} size={len(records)}")
+    print(f"[eval] Сплит: {split}, примеров: {len(records)}")
 
+    # --- Индекс путей к БД ---
     db_paths = build_db_path_index(
         records,
-        spider_db_dir=Path(config["spider_db_dir"]),
-        spider_test_db_dir=Path(config["spider_test_db_dir"]),
-        bird_train_db_dir=Path(config["bird_train_db_dir"]),
-        bird_dev_db_dir=Path(config["bird_dev_db_dir"]),
+        spider_db_dir=cfg["spider_db_dir"],
+        spider_test_db_dir=cfg["spider_test_db_dir"],
+        bird_train_db_dir=cfg["bird_train_db_dir"],
+        bird_dev_db_dir=cfg["bird_dev_db_dir"],
     )
 
-    resolved_model_path = resolve_model_path(config, model_path)
-    model, tokenizer = load_model_for_inference(resolved_model_path)
+    # --- Загрузка модели ---
+    if baseline_mode is None and model_path:
+        model, tokenizer = load_model_for_inference(
+            model_path, use_custom_tokens=use_custom_tokens
+        )
+    else:
+        # Для baseline: загружаем базовую модель без fine-tuning
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        model_name = cfg["model_name"]
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        model.eval()
+        use_custom_tokens = False  # baseline не имеет кастомных токенов
 
+    # --- Few-shot примеры для E0-FS ---
+    few_shot_examples = None
+    if baseline_mode == "few_shot":
+        train_records = (
+            load_jsonl(data_dir / "spider_train.jsonl")[:1000]
+        )
+        # 3 примера разной сложности: берём первые 3 из train
+        few_shot_examples = train_records[:3]
+
+    # --- Генерация предсказаний ---
+    print("[eval] Генерация SQL предсказаний...")
     predictions = generate_predictions(
         records=records,
         model=model,
         tokenizer=tokenizer,
+        use_custom_tokens=use_custom_tokens,
+        few_shot_examples=few_shot_examples,
         max_new_tokens=max_new_tokens,
         batch_size=batch_size,
         source_label=source_label,
     )
 
+    # --- Сохранение предсказаний ---
     out_dir = Path(output_dir)
     preds_dir = out_dir / "predictions"
     preds_dir.mkdir(parents=True, exist_ok=True)
-    preds_path = preds_dir / f"{EXPERIMENT_ID}_{split}_predictions.jsonl"
-    with open(preds_path, "w", encoding="utf-8") as file_obj:
-        for prediction in predictions:
-            file_obj.write(json.dumps(prediction, ensure_ascii=False) + "\n")
+    preds_path = preds_dir / f"{experiment_id}_{split}_predictions.jsonl"
+    with open(preds_path, "w", encoding="utf-8") as f:
+        for pred in predictions:
+            f.write(json.dumps(pred, ensure_ascii=False) + "\n")
+    print(f"[eval] Предсказания сохранены: {preds_path}")
 
-    metrics = compute_all_metrics(predictions=predictions, db_paths=db_paths)
-    metrics["experiment_id"] = EXPERIMENT_ID
+    # --- Вычисление метрик ---
+    metrics = compute_all_metrics(
+        predictions=predictions,
+        db_paths=db_paths,
+    )
+    metrics["experiment_id"] = experiment_id
     metrics["split"] = split
     metrics["n_predictions"] = len(predictions)
 
+    # --- Сохранение метрик ---
     metrics_dir = out_dir / "metrics"
     metrics_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = metrics_dir / f"{EXPERIMENT_ID}_{split}_metrics.json"
-    with open(metrics_path, "w", encoding="utf-8") as file_obj:
-        json.dump(metrics, file_obj, ensure_ascii=False, indent=2)
+    metrics_path = metrics_dir / f"{experiment_id}_{split}_metrics.json"
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
+    print(f"[eval] Метрики сохранены: {metrics_path}")
 
-    print_results(split, metrics)
+    # --- Вывод таблицы результатов ---
+    _print_results_table(experiment_id, split, metrics)
+
     return metrics
 
 
-def print_results(split: str, metrics: dict):
-    print(f"[metrics] split={split}")
-    print(f"EX={metrics.get('ex', 0):.4f}")
-    print(f"EM={metrics.get('em', 0):.4f}")
-    print(f"VSR={metrics.get('vsr', 0):.4f}")
-    if "ves" in metrics:
-        print(f"VES={metrics['ves']:.4f}")
-    if "bleu" in metrics:
-        print(f"BLEU={metrics['bleu']:.4f}")
-    if "rouge_l" in metrics:
-        print(f"ROUGE-L={metrics['rouge_l']:.4f}")
+def _build_complexity_lookup(json_path: Path, field: str) -> dict:
+    """Строит словарь {example_id: complexity} из оригинального JSON файла датасета.
 
+    Используется для обогащения JSONL-записей, сгенерированных до добавления
+    поля complexity в dataset_builder.py.
+    """
+    if not json_path.exists():
+        return {}
+    try:
+        with open(json_path, encoding="utf-8") as f:
+            examples = json.load(f)
+        return {i: ex.get(field, "unknown") for i, ex in enumerate(examples)}
+    except Exception:
+        return {}
+
+
+def _print_results_table(experiment_id: str, split: str, metrics: dict):
+    """Выводит таблицу результатов в stdout."""
+    print(f"\n{'='*50}")
+    print(f"Результаты: {experiment_id} | split={split}")
+    print(f"{'='*50}")
+    print(f"  EX  (Execution Accuracy): {metrics.get('ex', 0):.4f}")
+    print(f"  EM  (Exact Match):        {metrics.get('em', 0):.4f}")
+    print(f"  VSR (Valid SQL Rate):     {metrics.get('vsr', 0):.4f}")
+    if "ves" in metrics:
+        print(f"  VES (Valid Eff. Score):   {metrics['ves']:.4f}")
+    if "bleu" in metrics:
+        print(f"  BLEU:                     {metrics['bleu']:.4f}")
+    if "rouge_l" in metrics:
+        print(f"  ROUGE-L:                  {metrics['rouge_l']:.4f}")
+
+    if metrics.get("ex_by_source"):
+        print("\n  EX по источнику:")
+        for src, score in sorted(metrics["ex_by_source"].items()):
+            print(f"    {src:12s}: {score:.4f}")
+
+    if metrics.get("ex_by_complexity"):
+        print("\n  EX по сложности:")
+        order = ["easy", "medium", "hard", "extra", "unknown"]
+        for lvl in order:
+            if lvl in metrics["ex_by_complexity"]:
+                print(f"    {lvl:8s}: {metrics['ex_by_complexity'][lvl]:.4f}")
+    print(f"{'='*50}\n")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Main evaluation run")
-    parser.add_argument("--model_path", default=None)
+    parser = argparse.ArgumentParser(description="Оценка NL-to-SQL модели")
+    parser.add_argument("--model_path", default=None, help="Путь к дообученной модели")
     parser.add_argument(
         "--split",
         default="test",
         choices=["val", "test", "test_spider_held_out"],
+        help="Сплит для оценки",
     )
-    parser.add_argument("--config", default="configs/training_config.yaml")
+    parser.add_argument(
+        "--experiment",
+        default="E2",
+        help="ID эксперимента (E0-ZS, E0-FS, E1, E2, E3, E4, E5)",
+    )
+    parser.add_argument(
+        "--config",
+        default="configs/training_config.yaml",
+        help="Путь к конфигу",
+    )
+    parser.add_argument(
+        "--baseline",
+        default=None,
+        choices=["zero_shot", "few_shot"],
+        help="Режим baseline без fine-tuning",
+    )
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument("--output_dir", default="results")
@@ -311,7 +535,9 @@ if __name__ == "__main__":
         model_path=args.model_path,
         split=args.split,
         config_path=args.config,
+        experiment_id=args.experiment,
         batch_size=args.batch_size,
         max_new_tokens=args.max_new_tokens,
+        baseline_mode=args.baseline,
         output_dir=args.output_dir,
     )

@@ -1,4 +1,3 @@
-import argparse
 import json
 import sqlite3
 from abc import ABC, abstractmethod
@@ -40,11 +39,13 @@ class BaseDatasetBuilder(ABC):
 
     @abstractmethod
     def get_db_path(self, db_id: str) -> Optional[Path]:
+        """Return the path to the SQLite database file for the given db_id."""
         raise NotImplementedError
 
     def get_sample_values(
         self, db_id: str, table_name: str, column_name: str
     ) -> List[str]:
+        """Extract sample values from a column in the database."""
         cache_key = (db_id, table_name, column_name)
         if cache_key in self._sample_cache:
             return self._sample_cache[cache_key]
@@ -74,6 +75,7 @@ class BaseDatasetBuilder(ABC):
 
     @contextmanager
     def _get_db_connection(self, db_path: Path):
+        """Context manager for database connections."""
         conn = sqlite3.connect(str(db_path))
         try:
             yield conn
@@ -81,6 +83,7 @@ class BaseDatasetBuilder(ABC):
             conn.close()
 
     def _get_cached_db_path(self, db_id: str) -> Optional[Path]:
+        """Get cached database path."""
         if db_id not in self._db_path_cache:
             self._db_path_cache[db_id] = self.get_db_path(db_id)
         return self._db_path_cache[db_id]
@@ -243,6 +246,7 @@ class SpiderDatasetBuilder(BaseDatasetBuilder):
         return "spider"
 
     def get_db_path(self, db_id: str) -> Optional[Path]:
+        """Return the path to the SQLite database file for Spider."""
         for rel_path in self.SPIDER_PATHS:
             db_path = self.data_dir / rel_path / db_id / f"{db_id}.sqlite"
             if db_path.exists():
@@ -310,6 +314,7 @@ class BirdDatasetBuilder(BaseDatasetBuilder):
         return "bird"
 
     def get_db_path(self, db_id: str) -> Optional[Path]:
+        """Return the path to the SQLite database file for BIRD."""
         for _, rel_path in self.BIRD_PATHS:
             db_path = self.data_dir / rel_path / db_id / f"{db_id}.sqlite"
             if db_path.exists():
@@ -394,20 +399,10 @@ def build_all_datasets(
 
 
 def main():
-    project_root = Path(__file__).resolve().parent
-    parser = argparse.ArgumentParser(description="Build Spider and BIRD JSONL datasets")
-    parser.add_argument("--data_root", default=str(project_root / "data"))
-    parser.add_argument("--output_dir", default=str(project_root / "processed_data"))
-    parser.add_argument("--include_samples", action="store_true")
-    parser.add_argument("--num_samples", type=int, default=3)
-    args = parser.parse_args()
+    data_root = "/home/matvey/projects/fqw/data"
+    output_dir = "/home/matvey/projects/fqw/processed_data"
 
-    build_all_datasets(
-        args.data_root,
-        args.output_dir,
-        include_samples=args.include_samples,
-        num_samples=args.num_samples,
-    )
+    build_all_datasets(data_root, output_dir, include_samples=True, num_samples=3)
 
 
 if __name__ == "__main__":

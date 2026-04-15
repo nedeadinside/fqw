@@ -1,13 +1,13 @@
+import argparse
 import json
 import re
-from pathlib import Path
 from collections import defaultdict
+from pathlib import Path
 from typing import Dict, List, Tuple
-import argparse
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
 
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
 
 SQL_KEYWORDS_BY_STANDARD = {
     "SQL-86/87 (Core)": [
@@ -59,6 +59,7 @@ SQL_KEYWORDS_BY_STANDARD = {
         "ASC",
         "DESC",
     ],
+    # SQL-89 - Добавлены ограничения целостности
     "SQL-89 (Integrity)": [
         "PRIMARY KEY",
         "FOREIGN KEY",
@@ -68,6 +69,7 @@ SQL_KEYWORDS_BY_STANDARD = {
         "DEFAULT",
         "NOT NULL",
     ],
+    # SQL-92 - Крупное обновление
     "SQL-92 (Major)": [
         "CASE",
         "WHEN",
@@ -92,6 +94,7 @@ SQL_KEYWORDS_BY_STANDARD = {
         "||",
         "SET",
     ],
+    # SQL:1999 - Рекурсивные запросы, регулярные выражения
     "SQL:1999 (Recursive)": [
         "WITH",
         "WITH RECURSIVE",
@@ -102,6 +105,7 @@ SQL_KEYWORDS_BY_STANDARD = {
         "OVER",
         "PARTITION BY",  # Оконные функции (введены здесь, расширены в SQL:2003)
     ],
+    # SQL:2003 - XML, оконные функции, автоинкремент
     "SQL:2003 (Window/XML)": [
         "ROW_NUMBER",
         "RANK",
@@ -125,11 +129,13 @@ SQL_KEYWORDS_BY_STANDARD = {
         "SEQUENCE",
         "NEXTVAL",
     ],
+    # SQL:2006 - XML расширения
     "SQL:2006 (XML)": [
         "XMLQUERY",
         "XMLTABLE",
         "XMLEXISTS",
     ],
+    # SQL:2008 - ORDER BY вне курсоров, TRUNCATE, FETCH
     "SQL:2008 (FETCH/TRUNCATE)": [
         "TRUNCATE",
         "FETCH",
@@ -138,6 +144,7 @@ SQL_KEYWORDS_BY_STANDARD = {
         "OFFSET",
         "INSTEAD OF",
     ],
+    # SQL:2011 - Временные данные
     "SQL:2011 (Temporal)": [
         "PERIOD FOR",
         "SYSTEM_TIME",
@@ -146,6 +153,7 @@ SQL_KEYWORDS_BY_STANDARD = {
         "CURRENT_DATE",
         "CURRENT_TIME",
     ],
+    # SQL:2016 - JSON, row pattern matching
     "SQL:2016 (JSON)": [
         "JSON",
         "JSON_VALUE",
@@ -159,12 +167,14 @@ SQL_KEYWORDS_BY_STANDARD = {
         "->>",  # Операторы JSON
         "MATCH_RECOGNIZE",
     ],
+    # SQL:2023 - Графовые запросы
     "SQL:2023 (Graph/JSON)": [
         "GRAPH",
         "PROPERTY GRAPH",
         "MATCH",
         "PATH",
     ],
+    # Дополнительные часто используемые ключевые слова
     "Common Extensions": [
         "LIMIT",
         "TOP",  # Ограничение результатов (не стандарт, но широко используется)
@@ -204,6 +214,7 @@ SQL_KEYWORDS_BY_STANDARD = {
     ],
 }
 
+# Типы операций для категоризации запросов
 QUERY_TYPES = {
     "SELECT": r"\bSELECT\b",
     "INSERT": r"\bINSERT\b",
@@ -214,7 +225,9 @@ QUERY_TYPES = {
     "ALTER": r"\bALTER\b",
 }
 
+# Составные операции для более детального анализа
 COMPOSITE_PATTERNS = {
+    # Соединения
     "INNER JOIN": r"\bINNER\s+JOIN\b",
     "LEFT JOIN": r"\bLEFT\s+(OUTER\s+)?JOIN\b",
     "RIGHT JOIN": r"\bRIGHT\s+(OUTER\s+)?JOIN\b",
@@ -222,20 +235,25 @@ COMPOSITE_PATTERNS = {
     "CROSS JOIN": r"\bCROSS\s+JOIN\b",
     "NATURAL JOIN": r"\bNATURAL\s+JOIN\b",
     "JOIN (simple)": r"(?<!\w)\bJOIN\b(?!\s+(INNER|LEFT|RIGHT|FULL|CROSS|NATURAL))",
+    # Подзапросы и CTE
     "WITH (CTE)": r"\bWITH\b(?!\s+RECURSIVE)",
     "WITH RECURSIVE": r"\bWITH\s+RECURSIVE\b",
     "Subquery (nested SELECT)": r"\(\s*SELECT\b",
+    # Агрегация
     "GROUP BY": r"\bGROUP\s+BY\b",
     "HAVING": r"\bHAVING\b",
     "ORDER BY": r"\bORDER\s+BY\b",
+    # Ограничения результатов
     "LIMIT": r"\bLIMIT\b",
     "OFFSET": r"\bOFFSET\b",
     "FETCH": r"\bFETCH\b",
     "TOP": r"\bTOP\b",
+    # Множественные операции
     "UNION": r"\bUNION\b(?!\s+ALL)",
     "UNION ALL": r"\bUNION\s+ALL\b",
     "INTERSECT": r"\bINTERSECT\b",
     "EXCEPT": r"\bEXCEPT\b",
+    # Условия
     "WHERE": r"\bWHERE\b",
     "CASE WHEN": r"\bCASE\s+WHEN\b",
     "CASE": r"\bCASE\b",
@@ -243,6 +261,7 @@ COMPOSITE_PATTERNS = {
     "NULLIF": r"\bNULLIF\b",
     "IIF": r"\bIIF\b",
     "IFNULL": r"\bIFNULL\b",
+    # Операторы сравнения
     "IN (list)": r"\bIN\s*\(",
     "NOT IN": r"\bNOT\s+IN\b",
     "BETWEEN": r"\bBETWEEN\b",
@@ -253,7 +272,9 @@ COMPOSITE_PATTERNS = {
     "IS NOT NULL": r"\bIS\s+NOT\s+NULL\b",
     "EXISTS": r"\bEXISTS\b",
     "NOT EXISTS": r"\bNOT\s+EXISTS\b",
+    # DISTINCT
     "DISTINCT": r"\bDISTINCT\b",
+    # Агрегатные функции
     "COUNT(*)": r"\bCOUNT\s*\(\s*\*\s*\)",
     "COUNT": r"\bCOUNT\s*\(",
     "SUM": r"\bSUM\s*\(",
@@ -261,6 +282,7 @@ COMPOSITE_PATTERNS = {
     "MIN": r"\bMIN\s*\(",
     "MAX": r"\bMAX\s*\(",
     "GROUP_CONCAT": r"\bGROUP_CONCAT\s*\(",
+    # Оконные функции
     "OVER (window)": r"\bOVER\s*\(",
     "PARTITION BY": r"\bPARTITION\s+BY\b",
     "ROW_NUMBER": r"\bROW_NUMBER\s*\(",
@@ -268,8 +290,10 @@ COMPOSITE_PATTERNS = {
     "DENSE_RANK": r"\bDENSE_RANK\s*\(",
     "LEAD": r"\bLEAD\s*\(",
     "LAG": r"\bLAG\s*\(",
+    # Преобразование типов
     "CAST": r"\bCAST\s*\(",
     "CONVERT": r"\bCONVERT\s*\(",
+    # Строковые функции
     "CONCAT": r"\bCONCAT\s*\(",
     "|| (concat)": r"\|\|",
     "SUBSTRING/SUBSTR": r"\b(SUBSTRING|SUBSTR)\s*\(",
@@ -279,8 +303,10 @@ COMPOSITE_PATTERNS = {
     "REPLACE": r"\bREPLACE\s*\(",
     "LENGTH": r"\bLENGTH\s*\(",
     "INSTR": r"\bINSTR\s*\(",
+    # Математические функции
     "ABS": r"\bABS\s*\(",
     "ROUND": r"\bROUND\s*\(",
+    # Дата/время функции
     "DATE": r"\bDATE\s*\(",
     "TIME": r"\bTIME\s*\(",
     "DATETIME": r"\bDATETIME\s*\(",
@@ -289,9 +315,12 @@ COMPOSITE_PATTERNS = {
     "CURRENT_DATE": r"\bCURRENT_DATE\b",
     "CURRENT_TIME": r"\bCURRENT_TIME\b",
     "CURRENT_TIMESTAMP": r"\bCURRENT_TIMESTAMP\b",
+    # Порядок сортировки
     "ASC": r"\bASC\b",
     "DESC": r"\bDESC\b",
+    # Алиасы
     "AS (alias)": r"\bAS\b",
+    # Арифметические операции
     "Division (/)": r"(?<![<>])/(?![/*])",
     "Multiplication (*)": r"(?<!\()\*(?!\))",
     "Addition (+)": r"(?<![|])\+",
@@ -300,21 +329,35 @@ COMPOSITE_PATTERNS = {
 
 
 def strip_sql_literals_and_comments(sql: str) -> str:
-    
+    """Removes comments and quoted literals/identifiers to reduce false regex matches.
 
+    This is a lightweight heuristic parser tailored for dialect-level token detection.
+    It intentionally removes:
+    - Single-line comments: -- ...
+    - Block comments: /* ... */
+    - String literals: '...'
+    - Quoted identifiers: "...", `...`, [...]
+    """
+
+    # Block comments
     sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    # Single-line comments
     sql = re.sub(r"--[^\n]*", " ", sql)
 
+    # Single-quoted string literals (handles escaped '' inside)
     sql = re.sub(r"'(?:''|[^'])*'", " ", sql)
+    # Double-quoted identifiers/literals
     sql = re.sub(r'"(?:""|[^"])*"', " ", sql)
+    # Backtick-quoted identifiers
     sql = re.sub(r"`(?:``|[^`])*`", " ", sql)
+    # Bracket-quoted identifiers (SQLite)
     sql = re.sub(r"\[(?:\]\]|[^\]])*\]", " ", sql)
 
     return sql
 
 
 def load_jsonl(file_path: Path) -> List[dict]:
-    
+    """Загружает JSONL файл и возвращает список записей."""
     records = []
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -325,17 +368,17 @@ def load_jsonl(file_path: Path) -> List[dict]:
 
 
 def extract_sql(record: dict) -> str:
-    
+    """Извлекает SQL-запрос из записи."""
     return record.get("sql", "")
 
 
 def count_pattern(sql: str, pattern: str) -> int:
-    
+    """Подсчитывает количество вхождений паттерна в SQL."""
     return len(re.findall(pattern, sql, re.IGNORECASE))
 
 
 def analyze_sql(sql: str) -> Dict[str, int]:
-    
+    """Анализирует SQL-запрос и возвращает статистику токенов."""
     stats = defaultdict(int)
 
     sql = strip_sql_literals_and_comments(sql)
@@ -349,7 +392,7 @@ def analyze_sql(sql: str) -> Dict[str, int]:
 
 
 def get_query_type(sql: str) -> str:
-    
+    """Определяет тип запроса (SELECT, INSERT, и т.д.)."""
     sql = strip_sql_literals_and_comments(sql)
     for qtype, pattern in QUERY_TYPES.items():
         if re.search(pattern, sql, re.IGNORECASE):
@@ -358,7 +401,12 @@ def get_query_type(sql: str) -> str:
 
 
 def analyze_dataset(file_path: Path) -> Tuple[Dict[str, int], Dict[str, int], int]:
-    
+    """
+    Анализирует датасет и возвращает:
+    - Общую статистику токенов
+    - Статистику типов запросов
+    - Количество запросов
+    """
     records = load_jsonl(file_path)
 
     total_stats = defaultdict(int)
@@ -369,9 +417,11 @@ def analyze_dataset(file_path: Path) -> Tuple[Dict[str, int], Dict[str, int], in
         if not sql:
             continue
 
+        # Определяем тип запроса
         qtype = get_query_type(sql)
         query_type_stats[qtype] += 1
 
+        # Анализируем токены
         token_stats = analyze_sql(sql)
         for token, count in token_stats.items():
             total_stats[token] += count
@@ -380,9 +430,10 @@ def analyze_dataset(file_path: Path) -> Tuple[Dict[str, int], Dict[str, int], in
 
 
 def get_sql_standard_for_token(token: str) -> str:
-    
+    """Определяет стандарт SQL для токена."""
     token_upper = token.upper()
 
+    # Специальная обработка для составных токенов
     token_mapping = {
         "INNER JOIN": "INNER JOIN",
         "LEFT JOIN": "LEFT JOIN",
@@ -433,18 +484,20 @@ def print_report(
     query_type_stats: Dict[str, int],
     total_queries: int,
 ):
-    
-    print(f"\n{'='*80}")
+    """Выводит отчет по датасету."""
+    print(f"\n{'=' * 80}")
     print(f" Датасет: {dataset_name}")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
     print(f"\nВсего запросов: {total_queries}")
 
-    print(f"\n--- Типы запросов ---")
+    # Типы запросов
+    print("\n--- Типы запросов ---")
     for qtype, count in sorted(query_type_stats.items(), key=lambda x: -x[1]):
         pct = (count / total_queries * 100) if total_queries > 0 else 0
         print(f"  {qtype:15s}: {count:6d} ({pct:5.1f}%)")
 
-    print(f"\n--- Статистика SQL токенов (топ-50) ---")
+    # Топ токенов
+    print("\n--- Статистика SQL токенов (топ-50) ---")
     sorted_tokens = sorted(token_stats.items(), key=lambda x: -x[1])
 
     print(f"{'Токен':<30s} {'Кол-во':>8s} {'%':>8s} {'Стандарт SQL':<25s}")
@@ -456,7 +509,8 @@ def print_report(
         standard = get_sql_standard_for_token(token)
         print(f"  {token:<28s} {count:8d} {pct:7.1f}% {standard:<25s}")
 
-    print(f"\n--- Покрытие стандартов SQL ---")
+    # Покрытие стандартов SQL
+    print("\n--- Покрытие стандартов SQL ---")
     standard_stats = defaultdict(lambda: {"count": 0, "tokens": set()})
 
     for token, count in token_stats.items():
@@ -471,6 +525,7 @@ def print_report(
         stats = standard_stats.get(standard, {"count": 0, "tokens": set()})
         print(f"  {standard:<28s} {len(stats['tokens']):10d} {stats['count']:12d}")
 
+    # Неклассифицированные
     for standard in ["Unknown/Extension", "Operators"]:
         if standard in standard_stats:
             stats = standard_stats[standard]
@@ -480,15 +535,17 @@ def print_report(
 def print_comparison(
     all_datasets: Dict[str, Tuple[Dict[str, int], Dict[str, int], int]],
 ):
-    
-    print(f"\n{'='*100}")
+    """Выводит сравнительную таблицу по всем датасетам."""
+    print(f"\n{'=' * 100}")
     print(" СРАВНИТЕЛЬНАЯ ТАБЛИЦА ДАТАСЕТОВ")
-    print(f"{'='*100}")
+    print(f"{'=' * 100}")
 
+    # Собираем все уникальные токены
     all_tokens = set()
     for _, (token_stats, _, _) in all_datasets.items():
         all_tokens.update(token_stats.keys())
 
+    # Заголовок таблицы
     datasets = list(all_datasets.keys())
     header = f"{'Токен':<30s}"
     for ds in datasets:
@@ -496,6 +553,7 @@ def print_comparison(
     print(header)
     print("-" * (30 + 13 * len(datasets)))
 
+    # Собираем токены, отсортированные по сумме
     token_sums = {}
     for token in all_tokens:
         total = sum(all_datasets[ds][0].get(token, 0) for ds in datasets)
@@ -503,6 +561,7 @@ def print_comparison(
 
     sorted_tokens = sorted(token_sums.items(), key=lambda x: -x[1])
 
+    # Выводим топ-40 токенов
     for token, _ in sorted_tokens[:40]:
         row = f"  {token:<28s}"
         for ds in datasets:
@@ -510,7 +569,8 @@ def print_comparison(
             row += f" {count:12d}"
         print(row)
 
-    print(f"\n--- Общие метрики ---")
+    # Общие статистики
+    print("\n--- Общие метрики ---")
     row = f"  {'Всего запросов':<28s}"
     for ds in datasets:
         row += f" {all_datasets[ds][2]:12d}"
@@ -577,7 +637,7 @@ SQL_STANDARD_CATEGORIES = {
 
 
 def check_sql_has_category_token(sql: str, category_tokens: List[str]) -> bool:
-    
+    """Проверяет, содержит ли SQL хотя бы один токен из категории."""
     sql = strip_sql_literals_and_comments(sql)
     for token in category_tokens:
         pattern = COMPOSITE_PATTERNS.get(token)
@@ -589,7 +649,9 @@ def check_sql_has_category_token(sql: str, category_tokens: List[str]) -> bool:
 def analyze_dataset_for_coverage(
     file_paths: List[Path],
 ) -> Tuple[Dict[str, float], int]:
-    
+    """
+    Анализирует датасеты и возвращает % запросов, содержащих хотя бы один токен из каждой категории.
+    """
     category_counts = {cat: 0 for cat in SQL_STANDARD_CATEGORIES}
     total_queries = 0
 
@@ -619,13 +681,19 @@ def generate_coverage_chart(
     data_dir: Path,
     output_path: str = "sql_standards_coverage.png",
 ):
-    
+    """
+    Генерирует презентационный график покрытия групп SQL-конструкций (SQLite-диалект)
+    для объединённых датасетов BIRD и Spider.
+    """
+    # Настройка стиля
     plt.style.use("seaborn-v0_8-whitegrid")
     sns.set_palette("husl")
 
+    # Объединяем датасеты
     bird_files = list(data_dir.glob("bird_*.jsonl"))
     spider_files = list(data_dir.glob("spider_*.jsonl"))
 
+    # Рассчитываем покрытие для каждого объединённого датасета
     bird_coverage, bird_total = analyze_dataset_for_coverage(bird_files)
     spider_coverage, spider_total = analyze_dataset_for_coverage(spider_files)
 
@@ -640,11 +708,13 @@ def generate_coverage_chart(
     categories = list(SQL_STANDARD_CATEGORIES.keys())
     datasets = list(coverage_data.keys())
 
+    # Создание графика
     fig, ax = plt.subplots(figsize=(11, 6))
 
     x = np.arange(len(categories))
     width = 0.35  # Ширина столбца
 
+    # Цветовая палитра
     colors = ["#4C72B0", "#55A868"]  # Синий и зелёный
 
     dataset_totals = {
@@ -665,6 +735,7 @@ def generate_coverage_chart(
             linewidth=0.5,
         )
 
+        # Добавляем значения над столбцами
         for bar, val in zip(bars, values):
             height = bar.get_height()
             ax.annotate(
@@ -678,6 +749,7 @@ def generate_coverage_chart(
                 fontweight="bold",
             )
 
+    # Настройка осей и заголовка
     ax.set_ylabel("Доля запросов (%)", fontsize=12, fontweight="bold")
     ax.set_title(
         "Покрытие групп SQL-конструкций в наборах данных (SQLite)",
@@ -689,11 +761,14 @@ def generate_coverage_chart(
     ax.set_xticklabels(categories, fontsize=11, fontweight="bold")
     ax.set_ylim(0, 105)  # Ограничиваем до 100% с небольшим запасом для подписей
 
+    # Легенда
     ax.legend(loc="upper right", fontsize=11, framealpha=0.9)
 
+    # Убираем верхнюю и правую границу
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
+    # Добавляем сетку только по Y
     ax.yaxis.grid(True, linestyle="--", alpha=0.7)
     ax.xaxis.grid(False)
 
@@ -709,6 +784,7 @@ def generate_coverage_chart(
 
     plt.tight_layout(rect=(0, 0.04, 1, 1))
 
+    # Сохранение (PNG + PDF для вставки в презентацию)
     output_path = str(output_path)
     base = output_path
     if base.lower().endswith(".png"):
@@ -734,7 +810,7 @@ def main():
         "--data-dir",
         "-d",
         type=str,
-        default=str(Path(__file__).resolve().parents[2] / "processed_data"),
+        default="/home/matvey/projects/fqw/processed_data",
         help="Путь к директории с JSONL файлами",
     )
     parser.add_argument(
@@ -752,6 +828,7 @@ def main():
         print(f"Ошибка: директория {data_dir} не существует")
         return 1
 
+    # Находим все JSONL файлы
     jsonl_files = list(data_dir.glob("*.jsonl"))
 
     if not jsonl_files:
@@ -770,19 +847,24 @@ def main():
         token_stats, query_type_stats, total_queries = analyze_dataset(file_path)
         all_datasets[dataset_name] = (token_stats, query_type_stats, total_queries)
 
+        # Сохраняем результаты
         all_results[dataset_name] = {
             "total_queries": total_queries,
             "query_types": query_type_stats,
             "token_stats": token_stats,
         }
 
+        # Выводим отчет
         print_report(dataset_name, token_stats, query_type_stats, total_queries)
 
+    # Сравнительная таблица
     print_comparison(all_datasets)
 
+    # Генерация графика покрытия стандартов
     chart_path = data_dir / "sqlite_sql_feature_coverage.png"
     generate_coverage_chart(data_dir, str(chart_path))
 
+    # Сохранение результатов в JSON
     if args.output:
         output_path = Path(args.output)
         with open(output_path, "w", encoding="utf-8") as f:
