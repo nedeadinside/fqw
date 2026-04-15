@@ -7,7 +7,6 @@ results/
 *.pptx
 *.doc
 *.docx
-*.txt
 
 venv/
 .venv/
