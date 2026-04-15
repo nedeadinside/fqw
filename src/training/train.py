@@ -1,95 +1,56 @@
-"""
-Обучающий скрипт: QLoRA + SFTTrainer для задачи NL-to-SQL.
-
-Запуск:
-    python -m src.training.train [--config configs/training_config.yaml] [--experiment E2]
-
-Поддерживаемые эксперименты (из PLAN.md 4.1):
-    E1  QLoRA r=8,  custom tokens
-    E2  QLoRA r=16, custom tokens  (основной)
-    E3  QLoRA r=32, custom tokens
-    E4  QLoRA r=16, БЕЗ custom tokens (ablation)
-    E5  QLoRA r=16, attention only,  custom tokens (ablation)
-"""
-
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import torch
 import yaml
 from peft import get_peft_model, prepare_model_for_kbit_training
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    TrainingArguments,
-)
-from trl import DataCollatorForCompletionOnlyLM, SFTConfig, SFTTrainer
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import SFTConfig, SFTTrainer
 
-# Добавляем корень проекта в sys.path, чтобы импортировать src.*
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.data.dataset import (
-    CUSTOM_SPECIAL_TOKENS,
-    load_splits,
-)
+from src.data.dataset import CUSTOM_SPECIAL_TOKENS, load_splits
 from src.training.lora_config import (
     get_bnb_config,
     get_lora_config,
     get_lora_config_attention_only,
 )
 
-
-# ---------------------------------------------------------------------------
-# Конфигурация экспериментов
-# ---------------------------------------------------------------------------
-
 EXPERIMENT_CONFIGS = {
-    "E1": {"lora_r": 8,  "use_custom_tokens": True,  "attention_only": False},
-    "E2": {"lora_r": 16, "use_custom_tokens": True,  "attention_only": False},
-    "E3": {"lora_r": 32, "use_custom_tokens": True,  "attention_only": False},
+    "E1": {"lora_r": 8, "use_custom_tokens": True, "attention_only": False},
+    "E2": {"lora_r": 16, "use_custom_tokens": True, "attention_only": False},
+    "E3": {"lora_r": 32, "use_custom_tokens": True, "attention_only": False},
     "E4": {"lora_r": 16, "use_custom_tokens": False, "attention_only": False},
-    "E5": {"lora_r": 16, "use_custom_tokens": True,  "attention_only": True},
+    "E5": {"lora_r": 16, "use_custom_tokens": True, "attention_only": True},
 }
 
 
-# ---------------------------------------------------------------------------
-# Вспомогательные функции
-# ---------------------------------------------------------------------------
-
-def load_config(path: str) -> dict:
-    with open(path) as f:
+def load_config(path: str) -> dict[str, Any]:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def setup_tokenizer(model_name: str, use_custom_tokens: bool, custom_tokens: list[str]):
-    """Загружает токенизатор и добавляет кастомные специальные токены."""
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    tokenizer.padding_side = "right"  # Обязательно для SFT
+    tokenizer.padding_side = "right"
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     if use_custom_tokens:
-        num_added = tokenizer.add_special_tokens(
-            {"additional_special_tokens": custom_tokens}
-        )
-        print(f"[tokenizer] Добавлено {num_added} кастомных токенов: {custom_tokens}")
-
-        # Проверка: каждый тег = ровно 1 токен
+        tokenizer.add_special_tokens({"additional_special_tokens": custom_tokens})
         for tok in custom_tokens:
             ids = tokenizer.encode(tok, add_special_tokens=False)
-            assert len(ids) == 1, (
-                f"Токен '{tok}' токенизируется в {len(ids)} подтокенов "
-                f"вместо 1. Проверьте add_special_tokens."
-            )
-        print("[tokenizer] Все кастомные токены корректно добавлены (1 токен каждый).")
+            assert len(ids) == 1
 
     return tokenizer
 
 
 def setup_model(model_name: str, tokenizer, use_quantization: bool = True):
-    """Загружает модель с 4-bit квантизацией и расширяет embedding matrix."""
     bnb_config = get_bnb_config() if use_quantization else None
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -100,16 +61,51 @@ def setup_model(model_name: str, tokenizer, use_quantization: bool = True):
         trust_remote_code=True,
     )
 
-    # Расширяем embedding matrix для новых кастомных токенов
     model.resize_token_embeddings(len(tokenizer))
-    print(f"[model] Embedding matrix расширена до {len(tokenizer)} токенов.")
-
     return model
 
 
-# ---------------------------------------------------------------------------
-# Основная функция обучения
-# ---------------------------------------------------------------------------
+class CompletionOnlyDataCollator:
+    def __init__(self, tokenizer, response_template: str):
+        self.tokenizer = tokenizer
+        self.response_token_ids = tokenizer.encode(
+            response_template, add_special_tokens=False
+        )
+
+    def _find_last_subsequence(self, sequence, subsequence):
+        last_pos = None
+        limit = len(sequence) - len(subsequence) + 1
+        for i in range(limit):
+            if sequence[i : i + len(subsequence)] == subsequence:
+                last_pos = i
+        return last_pos
+
+    def __call__(self, features):
+        features = [
+            {k: v for k, v in feature.items() if k != "labels"} for feature in features
+        ]
+
+        batch = self.tokenizer.pad(features, padding=True, return_tensors="pt")
+
+        input_ids = batch["input_ids"]
+        attention_mask = batch.get("attention_mask", torch.ones_like(input_ids))
+        labels = input_ids.clone()
+
+        for i in range(input_ids.size(0)):
+            seq = input_ids[i].tolist()
+            start = self._find_last_subsequence(seq, self.response_token_ids)
+
+            if start is None:
+                labels[i, :] = -100
+                continue
+
+            end = start + len(self.response_token_ids)
+            labels[i, :end] = -100
+            labels[i, attention_mask[i] == 0] = -100
+
+        batch["labels"] = labels
+        return batch
+
 
 def train(config_path: str, experiment_id: str = "E2"):
     cfg = load_config(config_path)
@@ -124,19 +120,8 @@ def train(config_path: str, experiment_id: str = "E2"):
     output_dir = Path(cfg["output_dir"]) / experiment_id
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n{'='*60}")
-    print(f"Эксперимент: {experiment_id}")
-    print(f"  Модель:          {model_name}")
-    print(f"  LoRA rank:       {lora_r}")
-    print(f"  Custom tokens:   {use_custom_tokens}")
-    print(f"  Attention only:  {attention_only}")
-    print(f"  Output dir:      {output_dir}")
-    print(f"{'='*60}\n")
-
-    # 1. Токенизатор
     tokenizer = setup_tokenizer(model_name, use_custom_tokens, custom_tokens)
 
-    # 2. Датасеты
     splits = load_splits(
         processed_data_dir=cfg["processed_data_dir"],
         tokenizer=tokenizer,
@@ -146,14 +131,12 @@ def train(config_path: str, experiment_id: str = "E2"):
     train_dataset = splits["train"]
     val_dataset = splits["val"]
 
-    # 3. Модель
     model = setup_model(model_name, tokenizer, use_quantization=True)
     model = prepare_model_for_kbit_training(
         model,
         use_gradient_checkpointing=cfg.get("gradient_checkpointing", True),
     )
 
-    # 4. LoRA
     if attention_only:
         lora_config = get_lora_config_attention_only(
             r=lora_r,
@@ -168,17 +151,13 @@ def train(config_path: str, experiment_id: str = "E2"):
         )
 
     model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
 
-    # 5. DataCollator — loss только на токенах ответа (SQL)
-    # "<|im_start|>assistant\n" — начало assistant-turn в Qwen ChatML
     response_template = "<|im_start|>assistant\n"
-    collator = DataCollatorForCompletionOnlyLM(
-        response_template=response_template,
+    collator = CompletionOnlyDataCollator(
         tokenizer=tokenizer,
+        response_template=response_template,
     )
 
-    # 6. SFTConfig (наследует от TrainingArguments)
     bf16_flag = cfg.get("bf16", True)
     fp16_flag = not bf16_flag
 
@@ -209,51 +188,39 @@ def train(config_path: str, experiment_id: str = "E2"):
         report_to=cfg.get("report_to", "wandb"),
         run_name=f"{cfg.get('run_name', 'nl2sql')}-{experiment_id}",
         dataset_text_field="text",
-        max_seq_length=cfg.get("max_seq_length", 2048),
+        max_length=cfg.get("max_seq_length", 2048),
         packing=cfg.get("packing", False),
+        completion_only_loss=False,
+        assistant_only_loss=False,
     )
 
-    # 7. SFTTrainer
     trainer = SFTTrainer(
         model=model,
         args=sft_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=collator,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
     )
 
-    # 8. Обучение
-    print("[train] Начало обучения...")
     trainer.train()
 
-    # 9. Сохранение лучшего checkpoint + токенизатора
     best_dir = output_dir / "best"
     trainer.save_model(str(best_dir))
     tokenizer.save_pretrained(str(best_dir))
-    print(f"[train] Модель сохранена в {best_dir}")
 
     return str(best_dir)
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="QLoRA fine-tuning для NL-to-SQL")
-    parser.add_argument(
-        "--config",
-        default="configs/training_config.yaml",
-        help="Путь к YAML-конфигу",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="configs/training_config.yaml")
     parser.add_argument(
         "--experiment",
         default="E2",
         choices=list(EXPERIMENT_CONFIGS.keys()),
-        help="ID эксперимента (E1/E2/E3/E4/E5)",
     )
     args = parser.parse_args()
 
     best_checkpoint = train(args.config, args.experiment)
-    print(f"\nДообученная модель: {best_checkpoint}")
+    print(best_checkpoint)
