@@ -52,12 +52,11 @@ def get_lora_config(
     if lora_alpha is None:
         lora_alpha = 2 * r
 
-    # КРИТИЧЕСКИ ВАЖНО для кастомных токенов:
-    # LoRA покрывает attention/MLP, но НЕ embedding layer и lm_head.
-    # Без modules_to_save новые 4 строки embed_tokens инициализируются
-    # случайно и не обновляются при обучении.
-    # modules_to_save = обучать эти слои полностью в bf16.
-    modules_to_save = ["embed_tokens", "lm_head"] if use_custom_tokens else None
+    # modules_to_save trains these layers fully in bf16 so the 4 new token rows
+    # (embed_tokens) get proper gradients. lm_head is intentionally excluded:
+    # custom tokens appear only in user context, never in SQL output, so lm_head
+    # never needs to generate them — keeping it would waste ~2 GB for a 152K-vocab copy.
+    modules_to_save = ["embed_tokens"] if use_custom_tokens else None
 
     return LoraConfig(
         r=r,
@@ -83,7 +82,7 @@ def get_lora_config_attention_only(
     if lora_alpha is None:
         lora_alpha = 2 * r
 
-    modules_to_save = ["embed_tokens", "lm_head"] if use_custom_tokens else None
+    modules_to_save = ["embed_tokens"] if use_custom_tokens else None
 
     return LoraConfig(
         r=r,
