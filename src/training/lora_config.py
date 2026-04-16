@@ -1,24 +1,9 @@
-"""
-LoRA / QLoRA конфигурации для Qwen2.5-Coder-7B-Instruct.
-
-Две функции:
-    get_bnb_config()  — 4-bit NF4 квантизация (BitsAndBytesConfig)
-    get_lora_config() — LoRA адаптер + опциональный modules_to_save
-                        для обучения кастомных embedding
-"""
-
 import torch
 from peft import LoraConfig, TaskType
 from transformers import BitsAndBytesConfig
 
 
 def get_bnb_config() -> BitsAndBytesConfig:
-    """4-bit NormalFloat квантизация для QLoRA.
-
-    NF4 — информационно-оптимальный тип данных для нормально
-    распределённых весов нейросети (Dettmers et al., 2023).
-    Double quantization экономит ~0.37 бит/параметр.
-    """
     return BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -33,37 +18,22 @@ def get_lora_config(
     lora_dropout: float = 0.05,
     use_custom_tokens: bool = True,
 ) -> LoraConfig:
-    """LoRA конфигурация.
-
-    Args:
-        r: ранг матриц обновления (8 / 16 / 32 / 64)
-        lora_alpha: масштаб (по умолчанию 2*r, как в оригинальной статье)
-        lora_dropout: dropout на LoRA-адаптерах
-        use_custom_tokens: если True — добавляет modules_to_save для
-            embed_tokens и lm_head, чтобы обучать кастомные эмбеддинги
-            (<schema>, </schema>, <question>, </question>)
-
-    Целевые модули:
-        Attention: q_proj, k_proj, v_proj, o_proj
-        MLP:       gate_proj, up_proj, down_proj
-        Расширенный охват MLP даёт +1-2% EX по сравнению с attention-only
-        (Hu et al., 2022 + ablation E5 в данной работе).
-    """
     if lora_alpha is None:
         lora_alpha = 2 * r
 
-    # modules_to_save trains these layers fully in bf16 so the 4 new token rows
-    # (embed_tokens) get proper gradients. lm_head is intentionally excluded:
-    # custom tokens appear only in user context, never in SQL output, so lm_head
-    # never needs to generate them — keeping it would waste ~2 GB for a 152K-vocab copy.
-    modules_to_save = ["embed_tokens"] if use_custom_tokens else None
+    modules_to_save = ["embed_tokens", "lm_head"] if use_custom_tokens else None
 
     return LoraConfig(
         r=r,
         lora_alpha=lora_alpha,
         target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",   # attention
-            "gate_proj", "up_proj", "down_proj",       # MLP
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
         ],
         lora_dropout=lora_dropout,
         bias="none",
@@ -78,7 +48,6 @@ def get_lora_config_attention_only(
     lora_dropout: float = 0.05,
     use_custom_tokens: bool = True,
 ) -> LoraConfig:
-    """LoRA только на attention-проекциях (ablation E5)."""
     if lora_alpha is None:
         lora_alpha = 2 * r
 

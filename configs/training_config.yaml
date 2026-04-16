@@ -1,13 +1,8 @@
-# Конфигурация обучения QLoRA для задачи NL-to-SQL
-# Модель: Qwen/Qwen2.5-Coder-7B-Instruct
-
-# --- Модель ---
 model_name: "Qwen/Qwen2.5-Coder-7B-Instruct"
 max_seq_length: 1024
 
-# --- LoRA ---
 lora_r: 16
-lora_alpha: 32            # alpha = 2 * r (стандарт)
+lora_alpha: 32
 lora_dropout: 0.05
 lora_target_modules:
   - q_proj
@@ -21,29 +16,26 @@ modules_to_save:
   - embed_tokens
   - lm_head
 
-# --- Квантизация (QLoRA NF4) ---
 load_in_4bit: true
 bnb_4bit_quant_type: "nf4"
 bnb_4bit_compute_dtype: "bfloat16"
 bnb_4bit_use_double_quant: true
 
-# --- Обучение ---
 num_train_epochs: 3
 per_device_train_batch_size: 1
 per_device_eval_batch_size: 1
-gradient_accumulation_steps: 16 
+gradient_accumulation_steps: 16
 learning_rate: 2.0e-4
 lr_scheduler_type: "cosine"
 warmup_ratio: 0.03
 weight_decay: 0.01
 max_grad_norm: 1.0
 
-# --- Оптимизация памяти ---
 optim: "paged_adamw_8bit"
 bf16: true
 gradient_checkpointing: true
+use_liger_kernel: true
 
-# --- Оценка и сохранение ---
 output_dir: "./results/checkpoints"
 eval_strategy: "steps"
 eval_steps: 200
@@ -54,23 +46,19 @@ load_best_model_at_end: true
 metric_for_best_model: "eval_loss"
 greater_is_better: false
 
-# --- Логирование ---
 logging_steps: 10
 report_to: "wandb"
 run_name: "qwen2.5-coder-7b-qlora-r16-nl2sql"
 
-# --- Данные ---
 dataset_text_field: "text"
 packing: false
 
-# --- Кастомные токены ---
 custom_special_tokens:
   - "<schema>"
   - "</schema>"
   - "<question>"
   - "</question>"
 
-# --- Пути к данным ---
 processed_data_dir: "./processed_data"
 spider_db_dir: "./data/Spider/database"
 spider_test_db_dir: "./data/Spider/test_database"

@@ -1,16 +1,3 @@
-"""
-Загрузка JSONL-датасетов, форматирование промптов и разбиение на сплиты.
-
-Каждый JSONL-файл содержит записи с полями:
-    example_id, db_id, question, sql, schema
-
-Стратегия сплитов (из PLAN.md):
-    train  : spider_train + bird_train  (18 087 примеров)
-    val    : 50% spider_dev + 50% bird_dev, стратификация по db_id  (~1 284)
-    test   : оставшиеся 50% dev                                       (~1 284)
-    test_spider_held_out : spider_test                                (2 147)
-"""
-
 from __future__ import annotations
 
 import json
@@ -29,16 +16,7 @@ SYSTEM_PROMPT = (
 CUSTOM_SPECIAL_TOKENS = ["<schema>", "</schema>", "<question>", "</question>"]
 
 
-# ---------------------------------------------------------------------------
-# Форматирование одного примера в текст для SFT
-# ---------------------------------------------------------------------------
-
 def format_example(example: dict, tokenizer) -> str:
-    """Превращает JSONL-запись в строку для SFTTrainer.
-
-    Использует нативный apply_chat_template от Qwen (ChatML).
-    Кастомные токены <schema> / <question> уже в словаре к этому моменту.
-    """
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -59,11 +37,6 @@ def format_example(example: dict, tokenizer) -> str:
 
 
 def format_example_plain(example: dict, tokenizer) -> str:
-    """То же, но БЕЗ кастомных special tokens (для ablation E4).
-
-    Теги <schema>/<question> присутствуют как plain text — токенизируются
-    в подтокены, т.к. они не добавлены в словарь токенизатора.
-    """
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -83,10 +56,6 @@ def format_example_plain(example: dict, tokenizer) -> str:
     return text
 
 
-# ---------------------------------------------------------------------------
-# Загрузка одного JSONL-файла
-# ---------------------------------------------------------------------------
-
 def load_jsonl(path: str | Path) -> List[dict]:
     records = []
     with open(path, encoding="utf-8") as f:
@@ -97,20 +66,11 @@ def load_jsonl(path: str | Path) -> List[dict]:
     return records
 
 
-# ---------------------------------------------------------------------------
-# Стратифицированное разбиение dev-сплита по db_id
-# ---------------------------------------------------------------------------
-
 def stratified_dev_split(
     records: List[dict],
     val_ratio: float = 0.5,
     seed: int = 42,
 ) -> tuple[List[dict], List[dict]]:
-    """Делит список записей на (val, test) стратифицированно по db_id.
-
-    Все примеры одной БД попадают целиком в один сплит — исключает
-    data leakage внутри БД.
-    """
     rng = random.Random(seed)
 
     by_db: Dict[str, List[dict]] = defaultdict(list)
@@ -133,10 +93,6 @@ def stratified_dev_split(
     return val, test
 
 
-# ---------------------------------------------------------------------------
-# Публичный интерфейс: загрузка всех сплитов
-# ---------------------------------------------------------------------------
-
 def load_splits(
     processed_data_dir: str | Path,
     tokenizer,
@@ -144,19 +100,12 @@ def load_splits(
     use_custom_tokens: bool = True,
     seed: int = 42,
 ) -> Dict[str, Dataset]:
-    """Загружает все сплиты и возвращает HuggingFace Dataset-ы.
-
-    Returns dict с ключами:
-        "train", "val", "test", "test_spider_held_out"
-    """
     data_dir = Path(processed_data_dir)
 
     fmt = format_example if use_custom_tokens else format_example_plain
 
-    # --- Train ---
     spider_train = load_jsonl(data_dir / "spider_train.jsonl")
     bird_train = load_jsonl(data_dir / "bird_train.jsonl")
-    # Inject source для JSONL-файлов, сгенерированных до добавления этого поля
     for r in spider_train:
         r.setdefault("source", "spider")
     for r in bird_train:
@@ -164,7 +113,6 @@ def load_splits(
     train_records = spider_train + bird_train
     random.Random(seed).shuffle(train_records)
 
-    # --- Dev → val + test ---
     spider_dev = load_jsonl(data_dir / "spider_dev.jsonl")
     bird_dev = load_jsonl(data_dir / "bird_dev.jsonl")
     for r in spider_dev:
@@ -178,7 +126,6 @@ def load_splits(
     val_records = spider_val + bird_val
     test_records = spider_test_dev + bird_test_dev
 
-    # --- Spider held-out test ---
     spider_held_out = load_jsonl(data_dir / "spider_test.jsonl")
     for r in spider_held_out:
         r.setdefault("source", "spider")
@@ -203,17 +150,15 @@ def load_splits(
         "test_spider_held_out": _to_dataset(spider_held_out),
     }
 
-    print(f"[dataset] train={len(splits['train'])}, "
-          f"val={len(splits['val'])}, "
-          f"test={len(splits['test'])}, "
-          f"held_out={len(splits['test_spider_held_out'])}")
+    print(
+        f"[dataset] train={len(splits['train'])}, "
+        f"val={len(splits['val'])}, "
+        f"test={len(splits['test'])}, "
+        f"held_out={len(splits['test_spider_held_out'])}"
+    )
 
     return splits
 
-
-# ---------------------------------------------------------------------------
-# Вспомогательная функция: путь к .sqlite по db_id
-# ---------------------------------------------------------------------------
 
 def resolve_db_path(
     db_id: str,
@@ -224,11 +169,6 @@ def resolve_db_path(
     bird_dev_db_dir: str | Path,
     split: Optional[str] = None,
 ) -> Optional[Path]:
-    """Возвращает Path к .sqlite-файлу для заданного db_id.
-
-    source: "spider" | "bird"
-    split:  "train" | "dev" | "test"  (для определения директории у BIRD)
-    """
     if source == "spider":
         for base in [Path(spider_db_dir), Path(spider_test_db_dir)]:
             candidate = base / db_id / f"{db_id}.sqlite"
@@ -249,11 +189,6 @@ def build_db_path_index(
     bird_train_db_dir: str | Path,
     bird_dev_db_dir: str | Path,
 ) -> Dict[str, str]:
-    """Строит словарь {db_id: /path/to/db.sqlite} для списка записей.
-
-    Определяет источник (Spider vs BIRD) по наличию db_id в соответствующих
-    директориях — не требует поля 'source' в JSONL.
-    """
     index: Dict[str, str] = {}
     spider_db_dir = Path(spider_db_dir)
     spider_test_db_dir = Path(spider_test_db_dir)
@@ -266,8 +201,12 @@ def build_db_path_index(
             continue
 
         found = None
-        for base in [spider_db_dir, spider_test_db_dir,
-                     bird_train_db_dir, bird_dev_db_dir]:
+        for base in [
+            spider_db_dir,
+            spider_test_db_dir,
+            bird_train_db_dir,
+            bird_dev_db_dir,
+        ]:
             candidate = base / db_id / f"{db_id}.sqlite"
             if candidate.exists():
                 found = str(candidate)
@@ -276,7 +215,6 @@ def build_db_path_index(
         if found:
             index[db_id] = found
         else:
-            # Запись без БД — оценка будет пропущена для этого db_id
             index[db_id] = ""
 
     return index

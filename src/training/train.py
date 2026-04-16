@@ -6,8 +6,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# Must be set before torch initialises the CUDA allocator.
-# Prevents OOM from allocator fragmentation (2+ GB savings on 24 GB cards).
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
@@ -64,7 +62,7 @@ def setup_model(model_name: str, tokenizer, use_quantization: bool = True):
         device_map="auto",
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        attn_implementation="sdpa",  # avoids materialising O(seq²) attention matrix
+        attn_implementation="sdpa",
     )
 
     model.resize_token_embeddings(len(tokenizer))
@@ -182,6 +180,7 @@ def train(config_path: str, experiment_id: str = "E2"):
         fp16=fp16_flag,
         gradient_checkpointing=cfg.get("gradient_checkpointing", True),
         gradient_checkpointing_kwargs={"use_reentrant": False},
+        use_liger_kernel=cfg.get("use_liger_kernel", True),
         eval_strategy=cfg.get("eval_strategy", "steps"),
         eval_steps=cfg.get("eval_steps", 200),
         save_strategy=cfg.get("save_strategy", "steps"),
