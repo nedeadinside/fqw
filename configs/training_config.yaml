@@ -2,24 +2,8 @@ model_name: "Qwen/Qwen2.5-Coder-7B-Instruct"
 max_seq_length: 1024
 
 lora_r: 16
-lora_alpha: 32
 lora_dropout: 0.05
-lora_target_modules:
-  - q_proj
-  - k_proj
-  - v_proj
-  - o_proj
-  - gate_proj
-  - up_proj
-  - down_proj
-modules_to_save:
-  - embed_tokens
-  - lm_head
-
 load_in_4bit: true
-bnb_4bit_quant_type: "nf4"
-bnb_4bit_compute_dtype: "bfloat16"
-bnb_4bit_use_double_quant: true
 
 num_train_epochs: 3
 per_device_train_batch_size: 1
@@ -49,9 +33,6 @@ greater_is_better: false
 logging_steps: 10
 report_to: "wandb"
 run_name: "qwen2.5-coder-7b-qlora-r16-nl2sql"
-
-dataset_text_field: "text"
-packing: false
 
 custom_special_tokens:
   - "<schema>"

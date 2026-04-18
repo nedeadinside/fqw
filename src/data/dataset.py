@@ -4,7 +4,7 @@ import json
 import random
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from datasets import Dataset
 
@@ -17,26 +17,6 @@ CUSTOM_SPECIAL_TOKENS = ["<schema>", "</schema>", "<question>", "</question>"]
 
 
 def format_example(example: dict, tokenizer) -> str:
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"<schema>\n{example['schema']}\n</schema>\n\n"
-                f"<question>\n{example['question']}\n</question>"
-            ),
-        },
-        {"role": "assistant", "content": example["sql"]},
-    ]
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=False,
-    )
-    return text
-
-
-def format_example_plain(example: dict, tokenizer) -> str:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -96,13 +76,9 @@ def stratified_dev_split(
 def load_splits(
     processed_data_dir: str | Path,
     tokenizer,
-    max_seq_length: int = 2048,
-    use_custom_tokens: bool = True,
     seed: int = 42,
 ) -> Dict[str, Dataset]:
     data_dir = Path(processed_data_dir)
-
-    fmt = format_example if use_custom_tokens else format_example_plain
 
     spider_train = load_jsonl(data_dir / "spider_train.jsonl")
     bird_train = load_jsonl(data_dir / "bird_train.jsonl")
@@ -131,7 +107,7 @@ def load_splits(
         r.setdefault("source", "spider")
 
     def _to_dataset(records: List[dict]) -> Dataset:
-        texts = [fmt(r, tokenizer) for r in records]
+        texts = [format_example(r, tokenizer) for r in records]
         return Dataset.from_dict(
             {
                 "text": texts,
@@ -158,28 +134,6 @@ def load_splits(
     )
 
     return splits
-
-
-def resolve_db_path(
-    db_id: str,
-    source: str,
-    spider_db_dir: str | Path,
-    spider_test_db_dir: str | Path,
-    bird_train_db_dir: str | Path,
-    bird_dev_db_dir: str | Path,
-    split: Optional[str] = None,
-) -> Optional[Path]:
-    if source == "spider":
-        for base in [Path(spider_db_dir), Path(spider_test_db_dir)]:
-            candidate = base / db_id / f"{db_id}.sqlite"
-            if candidate.exists():
-                return candidate
-    elif source == "bird":
-        for base in [Path(bird_train_db_dir), Path(bird_dev_db_dir)]:
-            candidate = base / db_id / f"{db_id}.sqlite"
-            if candidate.exists():
-                return candidate
-    return None
 
 
 def build_db_path_index(

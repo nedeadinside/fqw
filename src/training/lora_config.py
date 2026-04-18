@@ -16,12 +16,9 @@ def get_lora_config(
     r: int = 16,
     lora_alpha: int | None = None,
     lora_dropout: float = 0.05,
-    use_custom_tokens: bool = True,
 ) -> LoraConfig:
     if lora_alpha is None:
         lora_alpha = 2 * r
-
-    modules_to_save = ["embed_tokens", "lm_head"] if use_custom_tokens else None
 
     return LoraConfig(
         r=r,
@@ -38,27 +35,5 @@ def get_lora_config(
         lora_dropout=lora_dropout,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
-        modules_to_save=modules_to_save,
-    )
-
-
-def get_lora_config_attention_only(
-    r: int = 16,
-    lora_alpha: int | None = None,
-    lora_dropout: float = 0.05,
-    use_custom_tokens: bool = True,
-) -> LoraConfig:
-    if lora_alpha is None:
-        lora_alpha = 2 * r
-
-    modules_to_save = ["embed_tokens"] if use_custom_tokens else None
-
-    return LoraConfig(
-        r=r,
-        lora_alpha=lora_alpha,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        lora_dropout=lora_dropout,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-        modules_to_save=modules_to_save,
+        modules_to_save=["embed_tokens", "lm_head"],
     )
