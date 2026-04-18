@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -17,8 +18,83 @@ from src.data.dataset import (
 )
 from src.evaluation.metrics import compute_all_metrics
 
-DEFAULT_CONFIG_PATH = "configs/training_config.yaml"
-RUN_ID = "E2"
+
+def _resolve_optional_path(path: str) -> Path:
+    candidate = Path(path)
+    if candidate.exists():
+        return candidate
+
+    project_candidate = Path(__file__).resolve().parents[2] / path
+    if project_candidate.exists():
+        return project_candidate
+
+    return candidate
+
+
+def _resolve_config_path(
+    config_path: str,
+) -> str:
+    resolved = _resolve_optional_path(config_path)
+    if resolved.exists():
+        return str(resolved)
+
+    raise FileNotFoundError(f"Eval config not found: {config_path}")
+
+
+def _load_yaml_config(path: str | Path) -> dict[str, Any]:
+    import yaml
+
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    if not isinstance(data, dict):
+        raise ValueError(f"Config must be a mapping: {path}")
+    return data
+
+
+def _build_eval_runtime_config(eval_cfg: dict[str, Any]) -> dict[str, Any]:
+    cfg = dict(eval_cfg)
+
+    train_cfg_path = cfg.get("train_config_path")
+    if train_cfg_path:
+        train_cfg_resolved = _resolve_optional_path(str(train_cfg_path))
+        if not train_cfg_resolved.exists():
+            raise FileNotFoundError(
+                f"Referenced train config not found: {train_cfg_path}"
+            )
+        train_cfg = _load_yaml_config(train_cfg_resolved)
+        for key in ["output_dir", "processed_data_dir", "load_in_4bit"]:
+            if key not in cfg and key in train_cfg:
+                cfg[key] = train_cfg[key]
+
+    required_keys = [
+        "processed_data_dir",
+        "spider_db_dir",
+        "spider_test_db_dir",
+        "bird_train_db_dir",
+        "bird_dev_db_dir",
+    ]
+    missing = [key for key in required_keys if key not in cfg]
+    if missing:
+        raise ValueError(f"Eval config missing required keys: {missing}")
+
+    return cfg
+
+
+def _validate_qwen_template_tokens(template_text: str, template_path: Path) -> None:
+    required_snippets = [
+        "<|im_start|>system",
+        "<|im_start|>user",
+        "<|im_start|>assistant",
+        "<|im_end|>",
+        "add_generation_prompt",
+    ]
+    missing = [snippet for snippet in required_snippets if snippet not in template_text]
+    if missing:
+        raise ValueError(
+            "Chat template is missing required Qwen system markers "
+            f"{missing} in {template_path}"
+        )
 
 
 def make_inference_prompt(example: dict, tokenizer) -> str:
@@ -122,10 +198,20 @@ def generate_predictions(
 def load_model_for_inference(
     model_path: str,
     load_in_4bit: bool = False,
+    chat_template_path: str | None = None,
 ):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+    if chat_template_path:
+        template_file = _resolve_optional_path(chat_template_path)
+        if not template_file.exists():
+            raise FileNotFoundError(f"Chat template not found: {chat_template_path}")
+
+        template_text = template_file.read_text(encoding="utf-8")
+        _validate_qwen_template_tokens(template_text, template_file)
+        tokenizer.chat_template = template_text
 
     num_added = tokenizer.add_special_tokens(
         {"additional_special_tokens": CUSTOM_SPECIAL_TOKENS}
@@ -171,18 +257,23 @@ def load_model_for_inference(
 def evaluate(
     model_path: str | None = None,
     split: str = "test",
-    config_path: str = DEFAULT_CONFIG_PATH,
+    config_path: str = "configs/eval_qwen.yaml",
     batch_size: int = 4,
     max_new_tokens: int = 512,
     output_dir: str = "results",
+    chat_template_path: str | None = None,
+    run_id: str = "E2",
 ) -> dict:
-    import yaml
-
-    with open(config_path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+    resolved_config_path = _resolve_config_path(config_path)
+    eval_cfg = _load_yaml_config(resolved_config_path)
+    cfg = _build_eval_runtime_config(eval_cfg)
 
     if model_path is None:
-        model_path = str(Path(cfg["output_dir"]) / RUN_ID / "best")
+        if "output_dir" not in cfg:
+            raise ValueError(
+                "output_dir is required in eval config when model_path is not set"
+            )
+        model_path = str(Path(cfg["output_dir"]) / run_id / "best")
 
     data_dir = Path(cfg["processed_data_dir"])
     allowed_splits = {"val", "test", "test_spider_held_out"}
@@ -218,6 +309,7 @@ def evaluate(
     model, tokenizer = load_model_for_inference(
         model_path=model_path,
         load_in_4bit=cfg.get("load_in_4bit", False),
+        chat_template_path=chat_template_path,
     )
 
     print("[eval] Генерация SQL предсказаний...")
@@ -232,7 +324,7 @@ def evaluate(
     out_dir = Path(output_dir)
     preds_dir = out_dir / "predictions"
     preds_dir.mkdir(parents=True, exist_ok=True)
-    preds_path = preds_dir / f"{RUN_ID}_{split}_predictions.jsonl"
+    preds_path = preds_dir / f"{run_id}_{split}_predictions.jsonl"
     with open(preds_path, "w", encoding="utf-8") as f:
         for pred in predictions:
             f.write(json.dumps(pred, ensure_ascii=False) + "\n")
@@ -242,18 +334,18 @@ def evaluate(
         predictions=predictions,
         db_paths=db_paths,
     )
-    metrics["run_id"] = RUN_ID
+    metrics["run_id"] = run_id
     metrics["split"] = split
     metrics["n_predictions"] = len(predictions)
 
     metrics_dir = out_dir / "metrics"
     metrics_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = metrics_dir / f"{RUN_ID}_{split}_metrics.json"
+    metrics_path = metrics_dir / f"{run_id}_{split}_metrics.json"
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
     print(f"[eval] Метрики сохранены: {metrics_path}")
 
-    _print_results_table(RUN_ID, split, metrics)
+    _print_results_table(run_id, split, metrics)
 
     return metrics
 
@@ -269,4 +361,22 @@ def _print_results_table(run_id: str, split: str, metrics: dict):
 
 
 if __name__ == "__main__":
-    evaluate()
+    EVAL_CONFIG_PATH = "configs/eval_qwen.yaml"
+    EVAL_CHAT_TEMPLATE_PATH: str | None = "templates/qwen_chat_template.jinja"
+    EVAL_MODEL_PATH: str | None = None
+    EVAL_SPLIT = "test"
+    EVAL_BATCH_SIZE = 4
+    EVAL_MAX_NEW_TOKENS = 512
+    EVAL_OUTPUT_DIR = "results"
+    EVAL_RUN_ID = "E2"
+
+    evaluate(
+        model_path=EVAL_MODEL_PATH,
+        split=EVAL_SPLIT,
+        config_path=EVAL_CONFIG_PATH,
+        batch_size=EVAL_BATCH_SIZE,
+        max_new_tokens=EVAL_MAX_NEW_TOKENS,
+        output_dir=EVAL_OUTPUT_DIR,
+        chat_template_path=EVAL_CHAT_TEMPLATE_PATH,
+        run_id=EVAL_RUN_ID,
+    )

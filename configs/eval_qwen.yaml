@@ -1,0 +1,6 @@
+train_config_path: "configs/train_qwen_2-5-3b.yaml"
+
+spider_db_dir: "./data/Spider/database"
+spider_test_db_dir: "./data/Spider/test_database"
+bird_train_db_dir: "./data/BIRD/train/train_databases"
+bird_dev_db_dir: "./data/BIRD/dev/dev_databases"

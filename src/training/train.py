@@ -21,18 +21,66 @@ from src.training.lora_config import (
     get_lora_config,
 )
 
-DEFAULT_CONFIG_PATH = "configs/training_config.yaml"
-RUN_ID = "E2"
-
 
 def load_config(path: str) -> dict[str, Any]:
     with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
-def setup_tokenizer(model_name: str, custom_tokens: list[str]):
+def _resolve_optional_path(path: str) -> Path:
+    candidate = Path(path)
+    if candidate.exists():
+        return candidate
+
+    project_candidate = Path(__file__).resolve().parents[2] / path
+    if project_candidate.exists():
+        return project_candidate
+
+    return candidate
+
+
+def _resolve_config_path(
+    config_path: str,
+) -> str:
+    resolved = _resolve_optional_path(config_path)
+    if resolved.exists():
+        return str(resolved)
+
+    raise FileNotFoundError(f"Train config not found: {config_path}")
+
+
+def _validate_qwen_template_tokens(template_text: str, template_path: Path) -> None:
+    required_snippets = [
+        "<|im_start|>system",
+        "<|im_start|>user",
+        "<|im_start|>assistant",
+        "<|im_end|>",
+        "add_generation_prompt",
+    ]
+    missing = [snippet for snippet in required_snippets if snippet not in template_text]
+    if missing:
+        raise ValueError(
+            "Chat template is missing required Qwen system markers "
+            f"{missing} in {template_path}"
+        )
+
+
+def setup_tokenizer(
+    model_name: str,
+    custom_tokens: list[str],
+    chat_template_path: str | None = None,
+):
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     tokenizer.padding_side = "right"
+
+    if chat_template_path:
+        template_file = _resolve_optional_path(chat_template_path)
+        if not template_file.exists():
+            raise FileNotFoundError(f"Chat template not found: {chat_template_path}")
+
+        template_text = template_file.read_text(encoding="utf-8")
+        _validate_qwen_template_tokens(template_text, template_file)
+        tokenizer.chat_template = template_text
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -103,17 +151,26 @@ class CompletionOnlyDataCollator:
         return batch
 
 
-def train(config_path: str = DEFAULT_CONFIG_PATH) -> str:
-    cfg = load_config(config_path)
+def train(
+    config_path: str,
+    chat_template_path: str | None = None,
+    run_id: str = "E2",
+    model_name_override: str | None = None,
+) -> str:
+    cfg = load_config(_resolve_config_path(config_path))
 
-    model_name = cfg["model_name"]
+    model_name = model_name_override or cfg["model_name"]
     lora_r = cfg.get("lora_r", 16)
     custom_tokens = cfg.get("custom_special_tokens", CUSTOM_SPECIAL_TOKENS)
 
-    output_dir = Path(cfg["output_dir"]) / RUN_ID
+    output_dir = Path(cfg["output_dir"]) / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    tokenizer = setup_tokenizer(model_name, custom_tokens)
+    tokenizer = setup_tokenizer(
+        model_name,
+        custom_tokens,
+        chat_template_path=chat_template_path,
+    )
 
     splits = load_splits(
         processed_data_dir=cfg["processed_data_dir"],
@@ -199,5 +256,13 @@ def train(config_path: str = DEFAULT_CONFIG_PATH) -> str:
 
 
 if __name__ == "__main__":
-    best_checkpoint = train()
+    TRAIN_CONFIG_PATH = "configs/train_qwen_2-5-3b.yaml"
+    TRAIN_CHAT_TEMPLATE_PATH: str | None = "templates/qwen_chat_template.jinja"
+    TRAIN_RUN_ID = "E2"
+
+    best_checkpoint = train(
+        config_path=TRAIN_CONFIG_PATH,
+        chat_template_path=TRAIN_CHAT_TEMPLATE_PATH,
+        run_id=TRAIN_RUN_ID,
+    )
     print(best_checkpoint)
