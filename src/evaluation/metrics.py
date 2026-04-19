@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-from src.evaluation.sql_executor import execute_sql, results_match
+from src.evaluation.sql_executor import (
+    execute_sql,
+    results_match,
+    results_match_permuted,
+)
 
 
 def normalize_sql(sql: str) -> str:
@@ -12,10 +16,11 @@ def normalize_sql(sql: str) -> str:
     return " ".join(sql.split())
 
 
-def execution_accuracy(
+def _ex_with_matcher(
     predictions: List[dict],
     db_paths: Dict[str, str],
-    timeout: float = 30.0,
+    timeout: float,
+    matcher,
 ) -> Tuple[float, List[bool]]:
     correct_flags = []
     for pred in predictions:
@@ -25,11 +30,27 @@ def execution_accuracy(
         correct_flags.append(
             pred_err is None
             and gold_err is None
-            and results_match(pred_result, gold_result)
+            and matcher(pred_result, gold_result)
         )
 
     score = sum(correct_flags) / len(correct_flags) if correct_flags else 0.0
     return score, correct_flags
+
+
+def execution_accuracy(
+    predictions: List[dict],
+    db_paths: Dict[str, str],
+    timeout: float = 30.0,
+) -> Tuple[float, List[bool]]:
+    return _ex_with_matcher(predictions, db_paths, timeout, results_match)
+
+
+def execution_accuracy_permuted(
+    predictions: List[dict],
+    db_paths: Dict[str, str],
+    timeout: float = 30.0,
+) -> Tuple[float, List[bool]]:
+    return _ex_with_matcher(predictions, db_paths, timeout, results_match_permuted)
 
 
 def exact_match(predictions: List[dict]) -> Tuple[float, List[bool]]:
@@ -56,19 +77,46 @@ def valid_sql_rate(
     return score, valid_flags
 
 
+def _breakdown_by_source(
+    predictions: List[dict],
+    flags: List[bool],
+) -> Dict[str, Dict[str, float]]:
+    buckets: Dict[str, List[bool]] = {}
+    for pred, flag in zip(predictions, flags):
+        src = pred.get("source", "unknown")
+        buckets.setdefault(src, []).append(flag)
+    return {
+        src: {
+            "score": sum(fs) / len(fs) if fs else 0.0,
+            "n": len(fs),
+            "n_correct": sum(fs),
+        }
+        for src, fs in buckets.items()
+    }
+
+
 def compute_all_metrics(
     predictions: List[dict],
     db_paths: Dict[str, str],
     timeout: float = 30.0,
 ) -> dict:
     ex, ex_flags = execution_accuracy(predictions, db_paths, timeout)
-    em, _ = exact_match(predictions)
-    vsr, _ = valid_sql_rate(predictions, db_paths, timeout)
+    ex_perm, ex_perm_flags = execution_accuracy_permuted(predictions, db_paths, timeout)
+    em, em_flags = exact_match(predictions)
+    vsr, vsr_flags = valid_sql_rate(predictions, db_paths, timeout)
 
     return {
-        "ex": ex,
+        "ex_permuted": ex_perm,
+        "ex_strict": ex,
         "em": em,
         "vsr": vsr,
         "n_examples": len(predictions),
-        "n_correct_ex": sum(ex_flags),
+        "n_correct_ex_permuted": sum(ex_perm_flags),
+        "n_correct_ex_strict": sum(ex_flags),
+        "by_source": {
+            "ex_permuted": _breakdown_by_source(predictions, ex_perm_flags),
+            "ex_strict": _breakdown_by_source(predictions, ex_flags),
+            "em": _breakdown_by_source(predictions, em_flags),
+            "vsr": _breakdown_by_source(predictions, vsr_flags),
+        },
     }

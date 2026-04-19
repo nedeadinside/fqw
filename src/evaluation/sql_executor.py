@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from collections import Counter
 from typing import FrozenSet, Optional, Tuple
 
 ResultSet = Optional[FrozenSet[tuple]]
@@ -59,3 +60,15 @@ def results_match(result_pred: ResultSet, result_gold: ResultSet) -> bool:
     if result_pred is None or result_gold is None:
         return False
     return result_pred == result_gold
+
+
+def _row_multiset(row: tuple) -> frozenset:
+    return frozenset(Counter(row).items())
+
+
+def results_match_permuted(result_pred: ResultSet, result_gold: ResultSet) -> bool:
+    if result_pred is None or result_gold is None:
+        return False
+    pred_norm = Counter(_row_multiset(r) for r in result_pred)
+    gold_norm = Counter(_row_multiset(r) for r in result_gold)
+    return pred_norm == gold_norm

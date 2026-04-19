@@ -6,7 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.data.dataset import load_jsonl, stratified_dev_split
-from src.evaluation.evaluate import (
+from src.evaluation.generate import (
     generate_predictions,
     load_model,
     setup_tokenizer,
