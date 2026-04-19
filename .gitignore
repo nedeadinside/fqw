@@ -22,7 +22,9 @@ __pycache__/
 .env
 .env.*
 
+meme
 wandb
+results_preds
 tea_debug.log
 .DS_Store
 Thumbs.db

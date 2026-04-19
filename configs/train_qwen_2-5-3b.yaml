@@ -1,5 +1,5 @@
 model_name: "Qwen/Qwen2.5-3B"
-max_seq_length: 1024
+max_seq_length: 4096
 
 lora_r: 16
 lora_dropout: 0.05

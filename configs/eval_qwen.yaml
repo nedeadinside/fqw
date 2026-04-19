@@ -1,9 +1,11 @@
-predictions_path: "./results/predictions/E2_test_predictions.jsonl"
-results_dir: "./results"
+predictions_path: "/home/matvey/projects/fqw/results_preds/predictions/E2_test_predictions.jsonl"
+results_dir: "/home/matvey/projects/fqw/results_preds"
 
-spider_db_dir: "./data/Spider/database"
-spider_test_db_dir: "./data/Spider/test_database"
-bird_train_db_dir: "./data/BIRD/train/train_databases"
-bird_dev_db_dir: "./data/BIRD/dev/dev_databases"
+spider_db_dir: "/home/matvey/projects/fqw/raw_data/Spider/database"
+spider_tables_json: "/home/matvey/projects/fqw/raw_data/Spider/tables.json"
+spider_test_db_dir: "/home/matvey/projects/fqw/raw_data/Spider/test_database"
+
+bird_train_db_dir: "/home/matvey/projects/fqw/raw_data/BIRD/train/train_databases"
+bird_dev_db_dir: "/home/matvey/projects/fqw/raw_data/BIRD/dev/dev_databases"
 
 execution_timeout: 30.0

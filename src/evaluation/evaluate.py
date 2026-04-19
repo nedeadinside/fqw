@@ -8,7 +8,11 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.data.dataset import build_db_path_index, load_jsonl
-from src.evaluation._config import load_config, resolve_config_path, resolve_optional_path
+from src.evaluation._config import (
+    load_config,
+    resolve_config_path,
+    resolve_optional_path,
+)
 from src.evaluation.metrics import compute_all_metrics
 
 REQUIRED_CONFIG_KEYS = (
@@ -61,6 +65,8 @@ def evaluate(config_path: str) -> dict:
         predictions=predictions,
         db_paths=db_paths,
         timeout=cfg.get("execution_timeout", 30.0),
+        spider_db_dir=cfg.get("spider_db_dir"),
+        spider_tables_json=cfg.get("spider_tables_json"),
     )
     metrics["predictions_path"] = str(predictions_path)
     metrics["n_predictions"] = len(predictions)
@@ -71,6 +77,6 @@ def evaluate(config_path: str) -> dict:
 
 
 if __name__ == "__main__":
-    EVAL_CONFIG_PATH = "configs/eval_qwen.yaml"
+    EVAL_CONFIG_PATH = "/home/matvey/projects/fqw/configs/eval_qwen.yaml"
     metrics = evaluate(config_path=EVAL_CONFIG_PATH)
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
