@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -17,6 +18,31 @@ from src.data.dataset import (
     stratified_dev_split,
 )
 from src.evaluation.metrics import compute_all_metrics
+
+ALLOWED_SPLITS = {"val", "test", "test_spider_held_out"}
+REQUIRED_CONFIG_KEYS = (
+    "processed_data_dir",
+    "spider_db_dir",
+    "spider_test_db_dir",
+    "bird_train_db_dir",
+    "bird_dev_db_dir",
+)
+QWEN_TEMPLATE_MARKERS = (
+    "<|im_start|>system",
+    "<|im_start|>user",
+    "<|im_start|>assistant",
+    "<|im_end|>",
+    "add_generation_prompt",
+)
+SQL_STOP_TOKENS = ("<|im_end|>", "<|endoftext|>", "</s>")
+
+
+def load_config(path: str | Path) -> dict[str, Any]:
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Config must be a mapping: {path}")
+    return data
 
 
 def _resolve_optional_path(path: str) -> Path:
@@ -31,70 +57,35 @@ def _resolve_optional_path(path: str) -> Path:
     return candidate
 
 
-def _resolve_config_path(
-    config_path: str,
-) -> str:
+def _resolve_config_path(config_path: str) -> str:
     resolved = _resolve_optional_path(config_path)
     if resolved.exists():
         return str(resolved)
-
     raise FileNotFoundError(f"Eval config not found: {config_path}")
 
 
-def _load_yaml_config(path: str | Path) -> dict[str, Any]:
-    import yaml
-
-    with open(path, encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-
-    if not isinstance(data, dict):
-        raise ValueError(f"Config must be a mapping: {path}")
-    return data
-
-
-def _build_eval_runtime_config(eval_cfg: dict[str, Any]) -> dict[str, Any]:
-    cfg = dict(eval_cfg)
-
-    train_cfg_path = cfg.get("train_config_path")
-    if train_cfg_path:
-        train_cfg_resolved = _resolve_optional_path(str(train_cfg_path))
-        if not train_cfg_resolved.exists():
-            raise FileNotFoundError(
-                f"Referenced train config not found: {train_cfg_path}"
-            )
-        train_cfg = _load_yaml_config(train_cfg_resolved)
-        for key in ["output_dir", "processed_data_dir", "load_in_4bit"]:
-            if key not in cfg and key in train_cfg:
-                cfg[key] = train_cfg[key]
-
-    required_keys = [
-        "processed_data_dir",
-        "spider_db_dir",
-        "spider_test_db_dir",
-        "bird_train_db_dir",
-        "bird_dev_db_dir",
-    ]
-    missing = [key for key in required_keys if key not in cfg]
-    if missing:
-        raise ValueError(f"Eval config missing required keys: {missing}")
-
-    return cfg
-
-
 def _validate_qwen_template_tokens(template_text: str, template_path: Path) -> None:
-    required_snippets = [
-        "<|im_start|>system",
-        "<|im_start|>user",
-        "<|im_start|>assistant",
-        "<|im_end|>",
-        "add_generation_prompt",
-    ]
-    missing = [snippet for snippet in required_snippets if snippet not in template_text]
+    missing = [m for m in QWEN_TEMPLATE_MARKERS if m not in template_text]
     if missing:
         raise ValueError(
-            "Chat template is missing required Qwen system markers "
-            f"{missing} in {template_path}"
+            f"Chat template is missing required Qwen markers {missing} in {template_path}"
         )
+
+
+def merge_train_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    train_cfg_path = cfg.get("train_config_path")
+    if not train_cfg_path:
+        return cfg
+
+    resolved = _resolve_optional_path(str(train_cfg_path))
+    if not resolved.exists():
+        raise FileNotFoundError(f"Referenced train config not found: {train_cfg_path}")
+
+    train_cfg = load_config(resolved)
+    for key in ("output_dir", "processed_data_dir", "load_in_4bit"):
+        if key not in cfg and key in train_cfg:
+            cfg[key] = train_cfg[key]
+    return cfg
 
 
 def make_inference_prompt(example: dict, tokenizer) -> str:
@@ -102,7 +93,6 @@ def make_inference_prompt(example: dict, tokenizer) -> str:
         f"<schema>\n{example['schema']}\n</schema>\n\n"
         f"<question>\n{example['question']}\n</question>"
     )
-
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
@@ -116,13 +106,14 @@ def make_inference_prompt(example: dict, tokenizer) -> str:
 
 def extract_sql(generated_text: str) -> str:
     sql = generated_text
+    if "<|im_start|>assistant" in sql:
+        sql = sql.split("<|im_start|>assistant")[-1]
 
-    for stop in ["<|im_end|>", "<|endoftext|>", "</s>"]:
+    for stop in SQL_STOP_TOKENS:
         if stop in sql:
             sql = sql[: sql.index(stop)]
 
     sql = sql.strip()
-
     if sql.startswith("```"):
         lines = sql.split("\n")
         inner = lines[1:]
@@ -133,74 +124,11 @@ def extract_sql(generated_text: str) -> str:
     return sql
 
 
-def generate_predictions(
-    records: list[dict],
-    model,
-    tokenizer,
-    max_new_tokens: int = 512,
-    batch_size: int = 4,
-) -> list[dict]:
-    model.eval()
-
-    eos_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-
-    generation_config = dict(
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        num_beams=1,
-        temperature=1.0,
-        repetition_penalty=1.1,
-        eos_token_id=eos_token_id,
-        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-    )
-
-    predictions = []
-    total = len(records)
-
-    for i in range(0, total, batch_size):
-        batch = records[i : i + batch_size]
-        prompts = []
-        for ex in batch:
-            prompts.append(make_inference_prompt(ex, tokenizer))
-
-        inputs = tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=3072,
-        ).to(model.device)
-
-        with torch.no_grad():
-            outputs = model.generate(**inputs, **generation_config)
-
-        input_lengths = inputs["input_ids"].shape[1]
-        generated_ids = outputs[:, input_lengths:]
-        decoded = tokenizer.batch_decode(generated_ids, skip_special_tokens=False)
-
-        for j, (ex, gen_text) in enumerate(zip(batch, decoded)):
-            sql = extract_sql(gen_text)
-            pred = {
-                "example_id": ex.get("example_id", f"{i + j}"),
-                "db_id": ex["db_id"],
-                "question": ex["question"],
-                "predicted_sql": sql,
-                "gold_sql": ex["sql"],
-            }
-            predictions.append(pred)
-
-        if (i // batch_size) % 10 == 0:
-            print(f"  [{i + len(batch)}/{total}] примеров обработано")
-
-    return predictions
-
-
-def load_model_for_inference(
+def setup_tokenizer(
     model_path: str,
-    load_in_4bit: bool = False,
     chat_template_path: str | None = None,
 ):
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
@@ -208,95 +136,154 @@ def load_model_for_inference(
         template_file = _resolve_optional_path(chat_template_path)
         if not template_file.exists():
             raise FileNotFoundError(f"Chat template not found: {chat_template_path}")
-
         template_text = template_file.read_text(encoding="utf-8")
         _validate_qwen_template_tokens(template_text, template_file)
         tokenizer.chat_template = template_text
 
-    num_added = tokenizer.add_special_tokens(
-        {"additional_special_tokens": CUSTOM_SPECIAL_TOKENS}
-    )
-    print(f"[inference] Кастомных токенов добавлено/найдено: {num_added}")
+    tokenizer.add_special_tokens({"additional_special_tokens": CUSTOM_SPECIAL_TOKENS})
+    return tokenizer
 
-    load_kwargs: dict = {
+
+def load_model(
+    model_path: str,
+    tokenizer,
+    load_in_4bit: bool = False,
+):
+    from transformers import AutoModelForCausalLM
+
+    load_kwargs: dict[str, Any] = {
         "trust_remote_code": True,
         "device_map": "auto",
+        "torch_dtype": torch.bfloat16,
     }
-
     if load_in_4bit:
         from src.training.lora_config import get_bnb_config
 
         load_kwargs["quantization_config"] = get_bnb_config()
-        load_kwargs["torch_dtype"] = torch.bfloat16
-    else:
-        load_kwargs["torch_dtype"] = torch.bfloat16
 
-    try:
+    adapter_config = Path(model_path) / "adapter_config.json"
+    if adapter_config.exists():
         from peft import PeftModel
 
-        adapter_config = Path(model_path) / "adapter_config.json"
-        if adapter_config.exists():
-            base_model_name = json.loads(adapter_config.read_text())[
-                "base_model_name_or_path"
-            ]
-            base = AutoModelForCausalLM.from_pretrained(base_model_name, **load_kwargs)
-            base.resize_token_embeddings(len(tokenizer))
-            model = PeftModel.from_pretrained(base, model_path)
-            print(f"[inference] Загружена PeftModel (LoRA adapter) из {model_path}")
-        else:
-            model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
-            print(f"[inference] Загружена merged модель из {model_path}")
-    except Exception:
+        base_model_name = json.loads(adapter_config.read_text())["base_model_name_or_path"]
+        base = AutoModelForCausalLM.from_pretrained(base_model_name, **load_kwargs)
+        base.resize_token_embeddings(len(tokenizer))
+        model = PeftModel.from_pretrained(base, model_path)
+    else:
         model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
-        print(f"[inference] Загружена модель из {model_path}")
 
     model.eval()
-    return model, tokenizer
+    return model
+
+
+def generate_predictions(
+    records: list[dict],
+    model,
+    tokenizer,
+    max_new_tokens: int = 512,
+    max_input_length: int = 3072,
+    do_sample: bool = False,
+    num_beams: int = 1,
+    seed: int = 42,
+) -> list[dict]:
+    model.eval()
+    torch.manual_seed(seed)
+
+    eos_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    generation_config = dict(
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        num_beams=num_beams,
+        eos_token_id=eos_token_id,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+    )
+
+    predictions = []
+    for i, ex in enumerate(records):
+        prompt = make_inference_prompt(ex, tokenizer)
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_input_length,
+        ).to(model.device)
+
+        with torch.no_grad():
+            outputs = model.generate(**inputs, **generation_config)
+
+        decoded = tokenizer.decode(outputs[0], skip_special_tokens=False)
+        predictions.append(
+            {
+                "example_id": ex.get("example_id", f"{i}"),
+                "db_id": ex["db_id"],
+                "question": ex["question"],
+                "predicted_sql": extract_sql(decoded),
+                "gold_sql": ex["sql"],
+            }
+        )
+
+    return predictions
+
+
+def select_records(processed_data_dir: str | Path, split: str) -> list[dict]:
+    data_dir = Path(processed_data_dir)
+
+    if split == "test_spider_held_out":
+        return load_jsonl(data_dir / "spider_test.jsonl")
+
+    spider_dev = load_jsonl(data_dir / "spider_dev.jsonl")
+    bird_dev = load_jsonl(data_dir / "bird_dev.jsonl")
+    spider_val, spider_test = stratified_dev_split(spider_dev)
+    bird_val, bird_test = stratified_dev_split(bird_dev)
+
+    if split == "val":
+        return spider_val + bird_val
+    return spider_test + bird_test
+
+
+def _resolve_model_path(
+    cfg: dict[str, Any],
+    run_id: str,
+    model_path_override: str | None,
+) -> str:
+    if model_path_override:
+        return model_path_override
+    if "output_dir" not in cfg:
+        raise ValueError("output_dir is required in eval config when model_path is not set")
+    return str(Path(cfg["output_dir"]) / run_id / "best")
+
+
+def _save_predictions(predictions: list[dict], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for pred in predictions:
+            f.write(json.dumps(pred, ensure_ascii=False) + "\n")
+
+
+def _save_metrics(metrics: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
 
 
 def evaluate(
-    model_path: str | None = None,
-    split: str = "test",
-    config_path: str = "configs/eval_qwen.yaml",
-    batch_size: int = 4,
-    max_new_tokens: int = 512,
-    output_dir: str = "results",
+    config_path: str,
     chat_template_path: str | None = None,
     run_id: str = "E2",
+    model_path_override: str | None = None,
 ) -> dict:
-    resolved_config_path = _resolve_config_path(config_path)
-    eval_cfg = _load_yaml_config(resolved_config_path)
-    cfg = _build_eval_runtime_config(eval_cfg)
+    cfg = merge_train_config(load_config(_resolve_config_path(config_path)))
 
-    if model_path is None:
-        if "output_dir" not in cfg:
-            raise ValueError(
-                "output_dir is required in eval config when model_path is not set"
-            )
-        model_path = str(Path(cfg["output_dir"]) / run_id / "best")
+    missing = [k for k in REQUIRED_CONFIG_KEYS if k not in cfg]
+    if missing:
+        raise ValueError(f"Eval config missing required keys: {missing}")
 
-    data_dir = Path(cfg["processed_data_dir"])
-    allowed_splits = {"val", "test", "test_spider_held_out"}
-    if split not in allowed_splits:
-        raise ValueError(
-            f"Unsupported split: {split}. Allowed: {sorted(allowed_splits)}"
-        )
+    split = cfg.get("split", "test")
+    if split not in ALLOWED_SPLITS:
+        raise ValueError(f"Unsupported split: {split}. Allowed: {sorted(ALLOWED_SPLITS)}")
 
-    if split == "test_spider_held_out":
-        records = load_jsonl(data_dir / "spider_test.jsonl")
-    else:
-        spider_dev = load_jsonl(data_dir / "spider_dev.jsonl")
-        bird_dev = load_jsonl(data_dir / "bird_dev.jsonl")
-
-        spider_val, spider_test = stratified_dev_split(spider_dev)
-        bird_val, bird_test = stratified_dev_split(bird_dev)
-
-        if split == "val":
-            records = spider_val + bird_val
-        else:
-            records = spider_test + bird_test
-
-    print(f"[eval] Сплит: {split}, примеров: {len(records)}")
+    model_path = _resolve_model_path(cfg, run_id, model_path_override)
+    records = select_records(cfg["processed_data_dir"], split)
 
     db_paths = build_db_path_index(
         records,
@@ -306,77 +293,48 @@ def evaluate(
         bird_dev_db_dir=cfg["bird_dev_db_dir"],
     )
 
-    model, tokenizer = load_model_for_inference(
-        model_path=model_path,
-        load_in_4bit=cfg.get("load_in_4bit", False),
-        chat_template_path=chat_template_path,
-    )
+    tokenizer = setup_tokenizer(model_path, chat_template_path=chat_template_path)
+    model = load_model(model_path, tokenizer, load_in_4bit=cfg.get("load_in_4bit", False))
 
-    print("[eval] Генерация SQL предсказаний...")
     predictions = generate_predictions(
         records=records,
         model=model,
         tokenizer=tokenizer,
-        max_new_tokens=max_new_tokens,
-        batch_size=batch_size,
+        max_new_tokens=cfg.get("max_new_tokens", 512),
+        max_input_length=cfg.get("max_input_length", 3072),
+        do_sample=cfg.get("do_sample", False),
+        num_beams=cfg.get("num_beams", 1),
+        seed=cfg.get("seed", 42),
     )
 
-    out_dir = Path(output_dir)
-    preds_dir = out_dir / "predictions"
-    preds_dir.mkdir(parents=True, exist_ok=True)
-    preds_path = preds_dir / f"{run_id}_{split}_predictions.jsonl"
-    with open(preds_path, "w", encoding="utf-8") as f:
-        for pred in predictions:
-            f.write(json.dumps(pred, ensure_ascii=False) + "\n")
-    print(f"[eval] Предсказания сохранены: {preds_path}")
+    results_dir = Path(cfg.get("results_dir", "./results"))
+    _save_predictions(predictions, results_dir / "predictions" / f"{run_id}_{split}_predictions.jsonl")
 
     metrics = compute_all_metrics(
         predictions=predictions,
         db_paths=db_paths,
+        timeout=cfg.get("execution_timeout", 30.0),
     )
-    metrics["run_id"] = run_id
-    metrics["split"] = split
-    metrics["n_predictions"] = len(predictions)
+    metrics.update({
+        "run_id": run_id,
+        "split": split,
+        "n_predictions": len(predictions),
+    })
 
-    metrics_dir = out_dir / "metrics"
-    metrics_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = metrics_dir / f"{run_id}_{split}_metrics.json"
-    with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, ensure_ascii=False, indent=2)
-    print(f"[eval] Метрики сохранены: {metrics_path}")
-
-    _print_results_table(run_id, split, metrics)
-
+    _save_metrics(metrics, results_dir / "metrics" / f"{run_id}_{split}_metrics.json")
     return metrics
-
-
-def _print_results_table(run_id: str, split: str, metrics: dict):
-    print(f"\n{'=' * 50}")
-    print(f"Результаты: {run_id} | split={split}")
-    print(f"{'=' * 50}")
-    print(f"  EX  (Execution Accuracy): {metrics.get('ex', 0):.4f}")
-    print(f"  EM  (Exact Match):        {metrics.get('em', 0):.4f}")
-    print(f"  VSR (Valid SQL Rate):     {metrics.get('vsr', 0):.4f}")
-    print(f"{'=' * 50}\n")
 
 
 if __name__ == "__main__":
     EVAL_CONFIG_PATH = "configs/eval_qwen.yaml"
     EVAL_CHAT_TEMPLATE_PATH: str | None = "templates/qwen_chat_template.jinja"
-    EVAL_MODEL_PATH: str | None = None
-    EVAL_SPLIT = "test"
-    EVAL_BATCH_SIZE = 4
-    EVAL_MAX_NEW_TOKENS = 512
-    EVAL_OUTPUT_DIR = "results"
     EVAL_RUN_ID = "E2"
+    EVAL_MODEL_PATH: str | None = None
 
-    evaluate(
-        model_path=EVAL_MODEL_PATH,
-        split=EVAL_SPLIT,
+    metrics = evaluate(
         config_path=EVAL_CONFIG_PATH,
-        batch_size=EVAL_BATCH_SIZE,
-        max_new_tokens=EVAL_MAX_NEW_TOKENS,
-        output_dir=EVAL_OUTPUT_DIR,
         chat_template_path=EVAL_CHAT_TEMPLATE_PATH,
         run_id=EVAL_RUN_ID,
+        model_path_override=EVAL_MODEL_PATH,
     )
+    print(json.dumps(metrics, ensure_ascii=False, indent=2))

@@ -22,6 +22,8 @@ __pycache__/
 .env
 .env.*
 
+wandb
+tea_debug.log
 .DS_Store
 Thumbs.db
 *.json

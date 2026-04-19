@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from typing import Optional, Tuple, FrozenSet
-
+from typing import FrozenSet, Optional, Tuple
 
 ResultSet = Optional[FrozenSet[tuple]]
 ExecutionResult = Tuple[ResultSet, Optional[str]]
 
 
 class _QueryThread(threading.Thread):
-
     def __init__(self, db_path: str, sql: str):
         super().__init__(daemon=True)
         self.db_path = db_path
@@ -40,29 +38,24 @@ def execute_sql(
     timeout: float = 30.0,
 ) -> ExecutionResult:
     if not db_path:
-        return None, "db_path не задан"
+        return None, "db_path is empty"
 
     sql_stripped = sql.strip()
     if not sql_stripped:
-        return None, "Пустой SQL-запрос"
+        return None, "empty SQL query"
 
     thread = _QueryThread(db_path, sql_stripped)
     thread.start()
     thread.join(timeout=timeout)
 
     if thread.is_alive():
-        return None, f"Таймаут выполнения ({timeout}s)"
-
+        return None, f"execution timeout ({timeout}s)"
     if thread.error is not None:
         return None, thread.error
-
     return thread.result, None
 
 
-def results_match(
-    result_pred: ResultSet,
-    result_gold: ResultSet,
-) -> bool:
+def results_match(result_pred: ResultSet, result_gold: ResultSet) -> bool:
     if result_pred is None or result_gold is None:
         return False
     return result_pred == result_gold

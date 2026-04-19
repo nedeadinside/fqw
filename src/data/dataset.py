@@ -28,12 +28,11 @@ def format_example(example: dict, tokenizer) -> str:
         },
         {"role": "assistant", "content": example["sql"]},
     ]
-    text = tokenizer.apply_chat_template(
+    return tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=False,
     )
-    return text
 
 
 def load_jsonl(path: str | Path) -> List[dict]:
@@ -73,6 +72,25 @@ def stratified_dev_split(
     return val, test
 
 
+def _tag_source(records: List[dict], source: str) -> List[dict]:
+    for r in records:
+        r.setdefault("source", source)
+    return records
+
+
+def _to_dataset(records: List[dict], tokenizer) -> Dataset:
+    return Dataset.from_dict(
+        {
+            "text": [format_example(r, tokenizer) for r in records],
+            "db_id": [r["db_id"] for r in records],
+            "question": [r["question"] for r in records],
+            "sql": [r["sql"] for r in records],
+            "source": [r.get("source", "unknown") for r in records],
+            "complexity": [r.get("complexity", "unknown") for r in records],
+        }
+    )
+
+
 def load_splits(
     processed_data_dir: str | Path,
     tokenizer,
@@ -80,21 +98,13 @@ def load_splits(
 ) -> Dict[str, Dataset]:
     data_dir = Path(processed_data_dir)
 
-    spider_train = load_jsonl(data_dir / "spider_train.jsonl")
-    bird_train = load_jsonl(data_dir / "bird_train.jsonl")
-    for r in spider_train:
-        r.setdefault("source", "spider")
-    for r in bird_train:
-        r.setdefault("source", "bird")
+    spider_train = _tag_source(load_jsonl(data_dir / "spider_train.jsonl"), "spider")
+    bird_train = _tag_source(load_jsonl(data_dir / "bird_train.jsonl"), "bird")
     train_records = spider_train + bird_train
     random.Random(seed).shuffle(train_records)
 
-    spider_dev = load_jsonl(data_dir / "spider_dev.jsonl")
-    bird_dev = load_jsonl(data_dir / "bird_dev.jsonl")
-    for r in spider_dev:
-        r.setdefault("source", "spider")
-    for r in bird_dev:
-        r.setdefault("source", "bird")
+    spider_dev = _tag_source(load_jsonl(data_dir / "spider_dev.jsonl"), "spider")
+    bird_dev = _tag_source(load_jsonl(data_dir / "bird_dev.jsonl"), "bird")
 
     spider_val, spider_test_dev = stratified_dev_split(spider_dev, seed=seed)
     bird_val, bird_test_dev = stratified_dev_split(bird_dev, seed=seed)
@@ -102,38 +112,14 @@ def load_splits(
     val_records = spider_val + bird_val
     test_records = spider_test_dev + bird_test_dev
 
-    spider_held_out = load_jsonl(data_dir / "spider_test.jsonl")
-    for r in spider_held_out:
-        r.setdefault("source", "spider")
+    spider_held_out = _tag_source(load_jsonl(data_dir / "spider_test.jsonl"), "spider")
 
-    def _to_dataset(records: List[dict]) -> Dataset:
-        texts = [format_example(r, tokenizer) for r in records]
-        return Dataset.from_dict(
-            {
-                "text": texts,
-                "db_id": [r["db_id"] for r in records],
-                "question": [r["question"] for r in records],
-                "sql": [r["sql"] for r in records],
-                "source": [r.get("source", "unknown") for r in records],
-                "complexity": [r.get("complexity", "unknown") for r in records],
-            }
-        )
-
-    splits = {
-        "train": _to_dataset(train_records),
-        "val": _to_dataset(val_records),
-        "test": _to_dataset(test_records),
-        "test_spider_held_out": _to_dataset(spider_held_out),
+    return {
+        "train": _to_dataset(train_records, tokenizer),
+        "val": _to_dataset(val_records, tokenizer),
+        "test": _to_dataset(test_records, tokenizer),
+        "test_spider_held_out": _to_dataset(spider_held_out, tokenizer),
     }
-
-    print(
-        f"[dataset] train={len(splits['train'])}, "
-        f"val={len(splits['val'])}, "
-        f"test={len(splits['test'])}, "
-        f"held_out={len(splits['test_spider_held_out'])}"
-    )
-
-    return splits
 
 
 def build_db_path_index(
@@ -143,32 +129,25 @@ def build_db_path_index(
     bird_train_db_dir: str | Path,
     bird_dev_db_dir: str | Path,
 ) -> Dict[str, str]:
-    index: Dict[str, str] = {}
-    spider_db_dir = Path(spider_db_dir)
-    spider_test_db_dir = Path(spider_test_db_dir)
-    bird_train_db_dir = Path(bird_train_db_dir)
-    bird_dev_db_dir = Path(bird_dev_db_dir)
+    bases = [
+        Path(spider_db_dir),
+        Path(spider_test_db_dir),
+        Path(bird_train_db_dir),
+        Path(bird_dev_db_dir),
+    ]
 
+    index: Dict[str, str] = {}
     for rec in records:
         db_id = rec["db_id"]
         if db_id in index:
             continue
 
-        found = None
-        for base in [
-            spider_db_dir,
-            spider_test_db_dir,
-            bird_train_db_dir,
-            bird_dev_db_dir,
-        ]:
+        found = ""
+        for base in bases:
             candidate = base / db_id / f"{db_id}.sqlite"
             if candidate.exists():
                 found = str(candidate)
                 break
-
-        if found:
-            index[db_id] = found
-        else:
-            index[db_id] = ""
+        index[db_id] = found
 
     return index

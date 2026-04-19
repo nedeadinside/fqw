@@ -4,3 +4,14 @@ spider_db_dir: "./data/Spider/database"
 spider_test_db_dir: "./data/Spider/test_database"
 bird_train_db_dir: "./data/BIRD/train/train_databases"
 bird_dev_db_dir: "./data/BIRD/dev/dev_databases"
+
+split: "test"
+results_dir: "./results"
+
+max_new_tokens: 512
+max_input_length: 3072
+do_sample: false
+num_beams: 1
+seed: 42
+
+execution_timeout: 30.0
