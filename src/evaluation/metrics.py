@@ -7,14 +7,13 @@ from tqdm import tqdm
 
 from src.evaluation.spider_eval_utils import (
     Evaluator,
-    Schema,
     build_foreign_key_map_from_json,
     build_valid_col_units,
     eval_exec_match,
     rebuild_sql_col,
     rebuild_sql_val,
 )
-from src.evaluation.spider_process_sql import get_schema, get_sql
+from src.evaluation.spider_process_sql import Schema, get_schema, get_sql
 from src.evaluation.sql_executor import (
     execute_sql,
     results_match,

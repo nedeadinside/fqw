@@ -18,10 +18,12 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-
+*.md
 .env
 .env.*
 
+logs
+old_runs
 meme
 wandb
 results_preds

@@ -19,8 +19,6 @@ REQUIRED_CONFIG_KEYS = (
     "predictions_path",
     "spider_db_dir",
     "spider_test_db_dir",
-    "bird_train_db_dir",
-    "bird_dev_db_dir",
 )
 
 
@@ -57,8 +55,6 @@ def evaluate(config_path: str) -> dict:
         predictions,
         spider_db_dir=cfg["spider_db_dir"],
         spider_test_db_dir=cfg["spider_test_db_dir"],
-        bird_train_db_dir=cfg["bird_train_db_dir"],
-        bird_dev_db_dir=cfg["bird_dev_db_dir"],
     )
 
     metrics = compute_all_metrics(

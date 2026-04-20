@@ -5,12 +5,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import torch
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.data.dataset import (
-    CUSTOM_SPECIAL_TOKENS,
     SYSTEM_PROMPT,
     load_jsonl,
     stratified_dev_split,
@@ -58,14 +55,28 @@ def make_inference_prompt(example: dict, tokenizer) -> str:
     )
 
 
+def _first_stop_idx(text: str, stops: tuple[str, ...]) -> int | None:
+    idx: int | None = None
+    for stop in stops:
+        stop_idx = text.find(stop)
+        if stop_idx != -1 and (idx is None or stop_idx < idx):
+            idx = stop_idx
+    return idx
+
+
 def extract_sql(generated_text: str) -> str:
     sql = generated_text
     if "<|im_start|>assistant" in sql:
         sql = sql.split("<|im_start|>assistant")[-1]
 
-    for stop in SQL_STOP_TOKENS:
-        if stop in sql:
-            sql = sql[: sql.index(stop)]
+    stop_idx = _first_stop_idx(sql, SQL_STOP_TOKENS)
+    if stop_idx is not None:
+        sql = sql[:stop_idx]
+
+    sql = sql.strip()
+
+    if "<evidence>" in sql and "</evidence>" in sql:
+        sql = sql[sql.index("</evidence>") + len("</evidence>") :]
 
     sql = sql.strip()
     if sql.startswith("```"):
@@ -81,6 +92,7 @@ def extract_sql(generated_text: str) -> str:
 def setup_tokenizer(
     model_path: str,
     chat_template_path: str | None = None,
+    custom_special_tokens: list[str] | None = None,
 ):
     from transformers import AutoTokenizer
 
@@ -94,78 +106,118 @@ def setup_tokenizer(
         _validate_qwen_template_tokens(template_text, template_file)
         tokenizer.chat_template = template_text
 
-    tokenizer.add_special_tokens({"additional_special_tokens": CUSTOM_SPECIAL_TOKENS})
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if custom_special_tokens:
+        for tok in custom_special_tokens:
+            ids = tokenizer.encode(tok, add_special_tokens=False)
+            if len(ids) != 1:
+                raise ValueError(
+                    "Tokenizer in model checkpoint is incompatible with custom token "
+                    f"{tok!r}. Ensure inference uses the exact tokenizer saved with training."
+                )
+
     return tokenizer
 
 
-def load_model(
+def load_vllm_engine(
     model_path: str,
-    tokenizer,
-    load_in_4bit: bool = False,
+    tensor_parallel_size: int = 1,
+    gpu_memory_utilization: float = 0.9,
+    max_model_len: int | None = None,
+    dtype: str = "bfloat16",
+    max_lora_rank: int = 64,
 ):
-    from transformers import AutoModelForCausalLM
+    from vllm import LLM
 
-    load_kwargs: dict[str, Any] = {
-        "trust_remote_code": True,
-        "device_map": "auto",
-        "torch_dtype": torch.bfloat16,
-    }
-    if load_in_4bit:
-        from src.training.lora_config import get_bnb_config
-
-        load_kwargs["quantization_config"] = get_bnb_config()
+    model_source = model_path
+    tokenizer_source = model_path
+    lora_request = None
 
     adapter_config = Path(model_path) / "adapter_config.json"
     if adapter_config.exists():
-        from peft import PeftModel
+        from vllm.lora.request import LoRARequest
 
-        base_model_name = json.loads(adapter_config.read_text())["base_model_name_or_path"]
-        base = AutoModelForCausalLM.from_pretrained(base_model_name, **load_kwargs)
-        base.resize_token_embeddings(len(tokenizer))
-        model = PeftModel.from_pretrained(base, model_path)
-    else:
-        model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+        adapter_meta = json.loads(adapter_config.read_text(encoding="utf-8"))
+        base_model_name = adapter_meta.get("base_model_name_or_path")
+        if not base_model_name:
+            raise ValueError(f"Missing base_model_name_or_path in {adapter_config}")
+        model_source = base_model_name
+        lora_request = LoRARequest("sql_adapter", 1, model_path)
 
-    model.eval()
-    return model
+    llm_kwargs: dict[str, Any] = {
+        "model": model_source,
+        "tokenizer": tokenizer_source,
+        "trust_remote_code": True,
+        "tensor_parallel_size": tensor_parallel_size,
+        "gpu_memory_utilization": gpu_memory_utilization,
+        "dtype": dtype,
+    }
+    if max_model_len is not None:
+        llm_kwargs["max_model_len"] = max_model_len
+    if lora_request is not None:
+        llm_kwargs["enable_lora"] = True
+        llm_kwargs["max_lora_rank"] = max_lora_rank
+
+    model = LLM(**llm_kwargs)
+
+    return model, lora_request
 
 
 def generate_predictions(
     records: list[dict],
-    model,
+    llm,
     tokenizer,
+    lora_request,
     max_new_tokens: int = 512,
     max_input_length: int = 3072,
     do_sample: bool = False,
     num_beams: int = 1,
     seed: int = 42,
 ) -> list[dict]:
-    model.eval()
-    torch.manual_seed(seed)
+    from vllm import SamplingParams
 
-    eos_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-    generation_config = dict(
-        max_new_tokens=max_new_tokens,
-        do_sample=do_sample,
-        num_beams=num_beams,
-        eos_token_id=eos_token_id,
-        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+    if do_sample:
+        temperature = 0.7
+        top_p = 0.95
+    else:
+        temperature = 0.0
+        top_p = 1.0
+
+    sampling_params = SamplingParams(
+        max_tokens=max_new_tokens,
+        stop=list(SQL_STOP_TOKENS),
+        temperature=temperature,
+        top_p=top_p,
+        top_k=-1,
+        use_beam_search=num_beams > 1,
+        seed=seed,
     )
 
-    predictions = []
-    for i, ex in enumerate(records):
+    prompts: list[str] = []
+    for ex in records:
         prompt = make_inference_prompt(ex, tokenizer)
-        inputs = tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=max_input_length,
-        ).to(model.device)
+        token_count = len(tokenizer.encode(prompt, add_special_tokens=False))
+        if token_count > max_input_length:
+            raise ValueError(
+                f"Prompt exceeds max_input_length={max_input_length} for example_id={ex.get('example_id')} "
+                f"(tokens={token_count}). Increase max_input_length or reduce schema context."
+            )
+        prompts.append(prompt)
 
-        with torch.no_grad():
-            outputs = model.generate(**inputs, **generation_config)
+    if lora_request is not None:
+        outputs = llm.generate(prompts, sampling_params, lora_request=lora_request)
+    else:
+        outputs = llm.generate(prompts, sampling_params)
 
-        decoded = tokenizer.decode(outputs[0], skip_special_tokens=False)
+    predictions = []
+    for i, (ex, out) in enumerate(zip(records, outputs)):
+        if out.outputs:
+            predicted_response = out.outputs[0].text.strip()
+        else:
+            predicted_response = ""
+
         predictions.append(
             {
                 "example_id": ex.get("example_id", f"{i}"),
@@ -173,7 +225,8 @@ def generate_predictions(
                 "db_id": ex["db_id"],
                 "question": ex["question"],
                 "gold_sql": ex["sql"],
-                "predicted_sql": extract_sql(decoded),
+                "predicted_response": predicted_response,
+                "predicted_sql": extract_sql(predicted_response),
             }
         )
 
@@ -193,13 +246,11 @@ def select_records(processed_data_dir: str | Path, split: str) -> list[dict]:
         return _tag(load_jsonl(data_dir / "spider_test.jsonl"), "spider")
 
     spider_dev = _tag(load_jsonl(data_dir / "spider_dev.jsonl"), "spider")
-    bird_dev = _tag(load_jsonl(data_dir / "bird_dev.jsonl"), "bird")
     spider_val, spider_test = stratified_dev_split(spider_dev)
-    bird_val, bird_test = stratified_dev_split(bird_dev)
 
     if split == "val":
-        return spider_val + bird_val
-    return spider_test + bird_test
+        return spider_val
+    return spider_test
 
 
 def _resolve_model_path(
@@ -235,18 +286,32 @@ def generate(
 
     split = cfg.get("split", "test")
     if split not in ALLOWED_SPLITS:
-        raise ValueError(f"Unsupported split: {split}. Allowed: {sorted(ALLOWED_SPLITS)}")
+        raise ValueError(
+            f"Unsupported split: {split}. Allowed: {sorted(ALLOWED_SPLITS)}"
+        )
 
     model_path = _resolve_model_path(cfg, run_id, model_path_override)
     records = select_records(cfg["processed_data_dir"], split)
 
-    tokenizer = setup_tokenizer(model_path, chat_template_path=chat_template_path)
-    model = load_model(model_path, tokenizer, load_in_4bit=cfg.get("load_in_4bit", False))
+    tokenizer = setup_tokenizer(
+        model_path,
+        chat_template_path=chat_template_path,
+        custom_special_tokens=cfg.get("custom_special_tokens"),
+    )
+    llm, lora_request = load_vllm_engine(
+        model_path=model_path,
+        tensor_parallel_size=cfg.get("tensor_parallel_size", 1),
+        gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.9),
+        max_model_len=cfg.get("max_model_len", cfg.get("max_seq_length")),
+        dtype=cfg.get("vllm_dtype", "bfloat16"),
+        max_lora_rank=cfg.get("max_lora_rank", 64),
+    )
 
     predictions = generate_predictions(
         records=records,
-        model=model,
+        llm=llm,
         tokenizer=tokenizer,
+        lora_request=lora_request,
         max_new_tokens=cfg.get("max_new_tokens", 512),
         max_input_length=cfg.get("max_input_length", 3072),
         do_sample=cfg.get("do_sample", False),

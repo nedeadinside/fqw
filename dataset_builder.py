@@ -1,10 +1,14 @@
 import json
 import sqlite3
+import sys
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from src.data.evidence import generate_evidence
 
 
 class BaseDatasetBuilder(ABC):
@@ -293,81 +297,19 @@ class SpiderDatasetBuilder(BaseDatasetBuilder):
     def build_record(
         self, idx: int, example: Dict[str, Any], schema: str
     ) -> Dict[str, Any]:
+        sql = example.get("query", "")
+        question = example.get("question", "") or ""
         return {
             "example_id": idx,
             "db_id": example.get("db_id"),
-            "question": example.get("question"),
-            "sql": example.get("query"),
+            "question": question,
+            "sql": sql,
             "schema": schema,
+            "evidence": generate_evidence(sql, question),
             "source": "spider",
             "complexity": example.get("hardness", "unknown"),
         }
 
-
-class BirdDatasetBuilder(BaseDatasetBuilder):
-    BIRD_PATHS = [
-        ("dev", "dev/dev_databases"),
-        ("train", "train/train_databases"),
-    ]
-
-    def get_dataset_name(self) -> str:
-        return "bird"
-
-    def get_db_path(self, db_id: str) -> Optional[Path]:
-        """Return the path to the SQLite database file for BIRD."""
-        for _, rel_path in self.BIRD_PATHS:
-            db_path = self.data_dir / rel_path / db_id / f"{db_id}.sqlite"
-            if db_path.exists():
-                return db_path
-        return None
-
-    def load_tables(self) -> None:
-        tables_files = [
-            self.data_dir / "train" / "train_tables.json",
-            self.data_dir / "dev" / "dev_tables.json",
-        ]
-
-        for tables_file in tables_files:
-            if tables_file.exists():
-                with open(tables_file, "r", encoding="utf-8") as f:
-                    tables_data = json.load(f)
-                for db_info in tables_data:
-                    if db_info["db_id"] not in self.tables:
-                        self.tables[db_info["db_id"]] = db_info
-
-    def load_queries(self, split: str = "train") -> List[Dict[str, Any]]:
-        split_files = {
-            "train": [self.data_dir / "train" / "train.json"],
-            "dev": [self.data_dir / "dev" / "dev.json"],
-        }
-
-        if split not in split_files:
-            raise ValueError(
-                f"Unknown split for BIRD: {split}. BIRD has only 'train' and 'dev' splits."
-            )
-
-        queries = []
-        for file in split_files[split]:
-            if file.exists():
-                with open(file, "r", encoding="utf-8") as f:
-                    queries.extend(json.load(f))
-        return queries
-
-    def _get_sql_field(self, example: Dict[str, Any]) -> str:
-        return example.get("SQL", "")
-
-    def build_record(
-        self, idx: int, example: Dict[str, Any], schema: str
-    ) -> Dict[str, Any]:
-        return {
-            "example_id": idx,
-            "db_id": example.get("db_id"),
-            "question": example.get("question"),
-            "sql": example.get("SQL"),
-            "schema": schema,
-            "source": "bird",
-            "complexity": example.get("difficulty", "unknown"),
-        }
 
 
 def build_all_datasets(
@@ -381,7 +323,6 @@ def build_all_datasets(
 
     builders_config = [
         (data_root / "Spider", SpiderDatasetBuilder, ["train", "dev", "test"]),
-        (data_root / "BIRD", BirdDatasetBuilder, ["train", "dev"]),
     ]
 
     for dataset_path, builder_class, splits in builders_config:

@@ -1,6 +1,7 @@
 # Core ML
 torch>=2.1.0
 transformers>=4.40.0
+vllm>=0.6.0
 peft>=0.10.0
 trl>=0.8.6
 bitsandbytes>=0.43.0
@@ -16,3 +17,6 @@ pyyaml>=6.0.0
 
 # Logging
 wandb>=0.17.0
+
+# SQL parsing
+sqlglot>=20.0.0

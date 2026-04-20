@@ -13,10 +13,19 @@ SYSTEM_PROMPT = (
     "in natural language, generate the corresponding SQL query for SQLite."
 )
 
-CUSTOM_SPECIAL_TOKENS = ["<schema>", "</schema>", "<question>", "</question>"]
+CUSTOM_SPECIAL_TOKENS = [
+    "<schema>", "</schema>",
+    "<question>", "</question>",
+    "<evidence>", "</evidence>",
+]
 
 
 def format_example(example: dict, tokenizer) -> str:
+    evidence = example.get("evidence", "")
+    if evidence:
+        assistant_content = f"<evidence>\n{evidence}\n</evidence>\n\n{example['sql']}"
+    else:
+        assistant_content = example["sql"]
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -26,7 +35,7 @@ def format_example(example: dict, tokenizer) -> str:
                 f"<question>\n{example['question']}\n</question>"
             ),
         },
-        {"role": "assistant", "content": example["sql"]},
+        {"role": "assistant", "content": assistant_content},
     ]
     return tokenizer.apply_chat_template(
         messages,
@@ -99,18 +108,15 @@ def load_splits(
     data_dir = Path(processed_data_dir)
 
     spider_train = _tag_source(load_jsonl(data_dir / "spider_train.jsonl"), "spider")
-    bird_train = _tag_source(load_jsonl(data_dir / "bird_train.jsonl"), "bird")
-    train_records = spider_train + bird_train
+    train_records = spider_train
     random.Random(seed).shuffle(train_records)
 
     spider_dev = _tag_source(load_jsonl(data_dir / "spider_dev.jsonl"), "spider")
-    bird_dev = _tag_source(load_jsonl(data_dir / "bird_dev.jsonl"), "bird")
 
     spider_val, spider_test_dev = stratified_dev_split(spider_dev, seed=seed)
-    bird_val, bird_test_dev = stratified_dev_split(bird_dev, seed=seed)
 
-    val_records = spider_val + bird_val
-    test_records = spider_test_dev + bird_test_dev
+    val_records = spider_val
+    test_records = spider_test_dev
 
     spider_held_out = _tag_source(load_jsonl(data_dir / "spider_test.jsonl"), "spider")
 
@@ -126,14 +132,10 @@ def build_db_path_index(
     records: List[dict],
     spider_db_dir: str | Path,
     spider_test_db_dir: str | Path,
-    bird_train_db_dir: str | Path,
-    bird_dev_db_dir: str | Path,
 ) -> Dict[str, str]:
     bases = [
         Path(spider_db_dir),
         Path(spider_test_db_dir),
-        Path(bird_train_db_dir),
-        Path(bird_dev_db_dir),
     ]
 
     index: Dict[str, str] = {}

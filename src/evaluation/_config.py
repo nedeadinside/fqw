@@ -43,7 +43,14 @@ def merge_train_config(cfg: dict[str, Any]) -> dict[str, Any]:
         raise FileNotFoundError(f"Referenced train config not found: {train_cfg_path}")
 
     train_cfg = load_config(resolved)
-    for key in ("output_dir", "processed_data_dir", "load_in_4bit"):
+    for key in (
+        "output_dir",
+        "processed_data_dir",
+        "load_in_4bit",
+        "custom_special_tokens",
+        "model_name",
+        "max_seq_length",
+    ):
         if key not in cfg and key in train_cfg:
             cfg[key] = train_cfg[key]
     return cfg

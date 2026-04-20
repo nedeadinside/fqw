@@ -3,9 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from src.evaluation.spider_process_sql import (
-    TABLE_TYPE,
-)
+from src.evaluation.spider_process_sql import TABLE_TYPE
 
 WHERE_OPS = (
     "not",
