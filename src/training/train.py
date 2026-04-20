@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -12,8 +11,6 @@ import yaml
 from peft import get_peft_model, prepare_model_for_kbit_training
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig, SFTTrainer
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.data.dataset import CUSTOM_SPECIAL_TOKENS, load_splits
 from src.training.lora_config import (
@@ -47,6 +44,19 @@ def _resolve_config_path(
         return str(resolved)
 
     raise FileNotFoundError(f"Train config not found: {config_path}")
+
+
+def _build_output_dir(cfg: dict[str, Any], run_id: str) -> Path:
+    checkpoint_dir = cfg.get("checkpoint_dir")
+    if checkpoint_dir:
+        return Path(str(checkpoint_dir))
+
+    output_root = cfg.get("output_dir")
+    if output_root is None:
+        raise ValueError("Train config requires 'checkpoint_dir' or 'output_dir'")
+
+    base = Path(str(output_root))
+    return base / run_id if run_id else base
 
 
 def _validate_qwen_template_tokens(template_text: str, template_path: Path) -> None:
@@ -152,18 +162,24 @@ class CompletionOnlyDataCollator:
 
 
 def train(
-    config_path: str,
+    config_path: str | None = None,
     chat_template_path: str | None = None,
     run_id: str = "E2",
     model_name_override: str | None = None,
+    cfg_override: dict[str, Any] | None = None,
 ) -> str:
-    cfg = load_config(_resolve_config_path(config_path))
+    if cfg_override is not None:
+        cfg = dict(cfg_override)
+    else:
+        if config_path is None:
+            raise ValueError("Either config_path or cfg_override must be provided")
+        cfg = load_config(_resolve_config_path(config_path))
 
     model_name = model_name_override or cfg["model_name"]
     lora_r = cfg.get("lora_r", 16)
     custom_tokens = cfg.get("custom_special_tokens", CUSTOM_SPECIAL_TOKENS)
 
-    output_dir = Path(cfg["output_dir"]) / run_id
+    output_dir = _build_output_dir(cfg, run_id)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     tokenizer = setup_tokenizer(

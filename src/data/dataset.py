@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import random
-from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List
 
@@ -14,9 +12,12 @@ SYSTEM_PROMPT = (
 )
 
 CUSTOM_SPECIAL_TOKENS = [
-    "<schema>", "</schema>",
-    "<question>", "</question>",
-    "<evidence>", "</evidence>",
+    "<schema>",
+    "</schema>",
+    "<question>",
+    "</question>",
+    "<evidence>",
+    "</evidence>",
 ]
 
 
@@ -54,33 +55,6 @@ def load_jsonl(path: str | Path) -> List[dict]:
     return records
 
 
-def stratified_dev_split(
-    records: List[dict],
-    val_ratio: float = 0.5,
-    seed: int = 42,
-) -> tuple[List[dict], List[dict]]:
-    rng = random.Random(seed)
-
-    by_db: Dict[str, List[dict]] = defaultdict(list)
-    for rec in records:
-        by_db[rec["db_id"]].append(rec)
-
-    db_ids = sorted(by_db.keys())
-    rng.shuffle(db_ids)
-
-    split_point = int(len(db_ids) * val_ratio)
-    val_dbs = set(db_ids[:split_point])
-
-    val, test = [], []
-    for db_id, recs in by_db.items():
-        if db_id in val_dbs:
-            val.extend(recs)
-        else:
-            test.extend(recs)
-
-    return val, test
-
-
 def _tag_source(records: List[dict], source: str) -> List[dict]:
     for r in records:
         r.setdefault("source", source)
@@ -103,28 +77,17 @@ def _to_dataset(records: List[dict], tokenizer) -> Dataset:
 def load_splits(
     processed_data_dir: str | Path,
     tokenizer,
-    seed: int = 42,
 ) -> Dict[str, Dataset]:
     data_dir = Path(processed_data_dir)
 
-    spider_train = _tag_source(load_jsonl(data_dir / "spider_train.jsonl"), "spider")
-    train_records = spider_train
-    random.Random(seed).shuffle(train_records)
-
-    spider_dev = _tag_source(load_jsonl(data_dir / "spider_dev.jsonl"), "spider")
-
-    spider_val, spider_test_dev = stratified_dev_split(spider_dev, seed=seed)
-
-    val_records = spider_val
-    test_records = spider_test_dev
-
-    spider_held_out = _tag_source(load_jsonl(data_dir / "spider_test.jsonl"), "spider")
+    train_records = _tag_source(load_jsonl(data_dir / "train.jsonl"), "spider")
+    val_records = _tag_source(load_jsonl(data_dir / "val.jsonl"), "spider")
+    test_records = _tag_source(load_jsonl(data_dir / "test.jsonl"), "spider")
 
     return {
         "train": _to_dataset(train_records, tokenizer),
         "val": _to_dataset(val_records, tokenizer),
         "test": _to_dataset(test_records, tokenizer),
-        "test_spider_held_out": _to_dataset(spider_held_out, tokenizer),
     }
 
 

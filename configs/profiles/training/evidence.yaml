@@ -1,0 +1,8 @@
+train:
+  custom_special_tokens:
+    - "<schema>"
+    - "</schema>"
+    - "<question>"
+    - "</question>"
+    - "<evidence>"
+    - "</evidence>"

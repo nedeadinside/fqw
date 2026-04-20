@@ -1,28 +1,23 @@
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 from typing import Any
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from src.data.dataset import (
     CUSTOM_SPECIAL_TOKENS,
     SYSTEM_PROMPT,
     load_jsonl,
-    stratified_dev_split,
 )
 from src.evaluation._config import (
     load_config,
-    merge_train_config,
     resolve_config_path,
     resolve_optional_path,
 )
 
-ALLOWED_SPLITS = {"val", "test", "test_spider_held_out"}
+ALLOWED_SPLITS = {"val", "test"}
 REQUIRED_CONFIG_KEYS = ("processed_data_dir",)
 QWEN_TEMPLATE_MARKERS = (
     "<|im_start|>system",
@@ -81,6 +76,7 @@ def extract_sql(generated_text: str) -> str:
 def setup_tokenizer(
     model_path: str,
     chat_template_path: str | None = None,
+    custom_tokens: list[str] | None = None,
 ):
     from transformers import AutoTokenizer
 
@@ -94,7 +90,12 @@ def setup_tokenizer(
         _validate_qwen_template_tokens(template_text, template_file)
         tokenizer.chat_template = template_text
 
-    tokenizer.add_special_tokens({"additional_special_tokens": CUSTOM_SPECIAL_TOKENS})
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    tokenizer.add_special_tokens(
+        {"additional_special_tokens": custom_tokens or CUSTOM_SPECIAL_TOKENS}
+    )
     return tokenizer
 
 
@@ -119,7 +120,9 @@ def load_model(
     if adapter_config.exists():
         from peft import PeftModel
 
-        base_model_name = json.loads(adapter_config.read_text())["base_model_name_or_path"]
+        base_model_name = json.loads(adapter_config.read_text())[
+            "base_model_name_or_path"
+        ]
         base = AutoModelForCausalLM.from_pretrained(base_model_name, **load_kwargs)
         base.resize_token_embeddings(len(tokenizer))
         model = PeftModel.from_pretrained(base, model_path)
@@ -188,18 +191,7 @@ def _tag(records: list[dict], source: str) -> list[dict]:
 
 def select_records(processed_data_dir: str | Path, split: str) -> list[dict]:
     data_dir = Path(processed_data_dir)
-
-    if split == "test_spider_held_out":
-        return _tag(load_jsonl(data_dir / "spider_test.jsonl"), "spider")
-
-    spider_dev = _tag(load_jsonl(data_dir / "spider_dev.jsonl"), "spider")
-    bird_dev = _tag(load_jsonl(data_dir / "bird_dev.jsonl"), "bird")
-    spider_val, spider_test = stratified_dev_split(spider_dev)
-    bird_val, bird_test = stratified_dev_split(bird_dev)
-
-    if split == "val":
-        return spider_val + bird_val
-    return spider_test + bird_test
+    return _tag(load_jsonl(data_dir / f"{split}.jsonl"), "spider")
 
 
 def _resolve_model_path(
@@ -208,10 +200,21 @@ def _resolve_model_path(
     model_path_override: str | None,
 ) -> str:
     if model_path_override:
-        return model_path_override
-    if "output_dir" not in cfg:
-        raise ValueError("output_dir is required in config when model_path is not set")
-    return str(Path(cfg["output_dir"]) / run_id / "best")
+        return str(resolve_optional_path(model_path_override))
+    if "model_path" in cfg:
+        return str(resolve_optional_path(str(cfg["model_path"])))
+    if "best_model_dir" in cfg:
+        return str(resolve_optional_path(str(cfg["best_model_dir"])))
+    if "checkpoint_dir" in cfg:
+        candidate = Path(str(cfg["checkpoint_dir"])) / "best"
+        return str(resolve_optional_path(str(candidate)))
+    if "output_dir" in cfg:
+        root = Path(str(cfg["output_dir"]))
+        candidate = root / run_id / "best" if run_id else root / "best"
+        return str(resolve_optional_path(str(candidate)))
+    raise ValueError(
+        "Config must contain one of: model_path, best_model_dir, checkpoint_dir, output_dir"
+    )
 
 
 def _save_predictions(predictions: list[dict], path: Path) -> None:
@@ -222,12 +225,18 @@ def _save_predictions(predictions: list[dict], path: Path) -> None:
 
 
 def generate(
-    config_path: str,
+    config_path: str | None = None,
     chat_template_path: str | None = None,
     run_id: str = "E2",
     model_path_override: str | None = None,
+    cfg_override: dict[str, Any] | None = None,
 ) -> Path:
-    cfg = merge_train_config(load_config(resolve_config_path(config_path)))
+    if cfg_override is not None:
+        cfg = dict(cfg_override)
+    else:
+        if config_path is None:
+            raise ValueError("Either config_path or cfg_override must be provided")
+        cfg = load_config(resolve_config_path(config_path))
 
     missing = [k for k in REQUIRED_CONFIG_KEYS if k not in cfg]
     if missing:
@@ -235,13 +244,22 @@ def generate(
 
     split = cfg.get("split", "test")
     if split not in ALLOWED_SPLITS:
-        raise ValueError(f"Unsupported split: {split}. Allowed: {sorted(ALLOWED_SPLITS)}")
+        raise ValueError(
+            f"Unsupported split: {split}. Allowed: {sorted(ALLOWED_SPLITS)}"
+        )
 
     model_path = _resolve_model_path(cfg, run_id, model_path_override)
     records = select_records(cfg["processed_data_dir"], split)
+    custom_tokens = cfg.get("custom_special_tokens", CUSTOM_SPECIAL_TOKENS)
 
-    tokenizer = setup_tokenizer(model_path, chat_template_path=chat_template_path)
-    model = load_model(model_path, tokenizer, load_in_4bit=cfg.get("load_in_4bit", False))
+    tokenizer = setup_tokenizer(
+        model_path,
+        chat_template_path=chat_template_path,
+        custom_tokens=custom_tokens,
+    )
+    model = load_model(
+        model_path, tokenizer, load_in_4bit=cfg.get("load_in_4bit", False)
+    )
 
     predictions = generate_predictions(
         records=records,
@@ -254,8 +272,16 @@ def generate(
         seed=cfg.get("seed", 42),
     )
 
-    results_dir = Path(cfg.get("results_dir", "./results"))
-    out_path = results_dir / "predictions" / f"{run_id}_{split}_predictions.jsonl"
+    if "predictions_path" in cfg:
+        out_path = Path(str(cfg["predictions_path"]))
+    else:
+        results_dir = Path(str(cfg.get("results_dir", "./results")))
+        filename = (
+            f"{run_id}_{split}_predictions.jsonl"
+            if run_id
+            else f"{split}_predictions.jsonl"
+        )
+        out_path = results_dir / "predictions" / filename
     _save_predictions(predictions, out_path)
     return out_path
 

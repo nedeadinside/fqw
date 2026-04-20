@@ -1,0 +1,4 @@
+model:
+  name: "Qwen/Qwen2.5-Coder-7B-Instruct"
+  max_seq_length: 1024
+  load_in_4bit: true

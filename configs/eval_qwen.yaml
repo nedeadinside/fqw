@@ -1,8 +1,8 @@
-predictions_path: "/home/matvey/projects/fqw/results_preds/predictions/E2_test_predictions.jsonl"
-results_dir: "/home/matvey/projects/fqw/results_preds"
+predictions_path: "./results_preds/predictions/E2_test_predictions.jsonl"
+results_dir: "./results_preds"
 
-spider_db_dir: "/home/matvey/projects/fqw/raw_data/Spider/database"
-spider_tables_json: "/home/matvey/projects/fqw/raw_data/Spider/tables.json"
-spider_test_db_dir: "/home/matvey/projects/fqw/raw_data/Spider/test_database"
+spider_db_dir: "./raw_data/Spider/database"
+spider_tables_json: "./raw_data/Spider/tables.json"
+spider_test_db_dir: "./raw_data/Spider/test_database"
 
 execution_timeout: 30.0

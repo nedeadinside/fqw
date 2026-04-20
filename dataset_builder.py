@@ -1,13 +1,11 @@
 import json
 import sqlite3
-import sys
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from src.data.evidence import generate_evidence
 
 
@@ -185,7 +183,7 @@ class BaseDatasetBuilder(ABC):
         queries = self.load_queries(split)
 
         if output_file is None:
-            output_file = self.output_dir / f"{self.get_dataset_name()}_{split}.jsonl"
+            output_file = self.output_dir / f"{split}.jsonl"
 
         output_path = Path(output_file)
 
@@ -277,7 +275,7 @@ class SpiderDatasetBuilder(BaseDatasetBuilder):
                 self.data_dir / "train_spider.json",
                 self.data_dir / "train_others.json",
             ],
-            "dev": [self.data_dir / "dev.json"],
+            "val": [self.data_dir / "dev.json"],
             "test": [self.data_dir / "test.json"],
         }
 
@@ -311,7 +309,6 @@ class SpiderDatasetBuilder(BaseDatasetBuilder):
         }
 
 
-
 def build_all_datasets(
     data_root: str,
     output_dir: str,
@@ -322,7 +319,7 @@ def build_all_datasets(
     output_dir = Path(output_dir)
 
     builders_config = [
-        (data_root / "Spider", SpiderDatasetBuilder, ["train", "dev", "test"]),
+        (data_root / "Spider", SpiderDatasetBuilder, ["train", "val", "test"]),
     ]
 
     for dataset_path, builder_class, splits in builders_config:
@@ -340,7 +337,7 @@ def build_all_datasets(
 
 
 def main():
-    data_root = "/home/matvey/projects/fqw/data"
+    data_root = "/home/matvey/projects/fqw/raw_data"
     output_dir = "/home/matvey/projects/fqw/processed_data"
 
     build_all_datasets(data_root, output_dir, include_samples=True, num_samples=3)

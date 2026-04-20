@@ -31,26 +31,3 @@ def resolve_config_path(config_path: str) -> str:
     if resolved.exists():
         return str(resolved)
     raise FileNotFoundError(f"Config not found: {config_path}")
-
-
-def merge_train_config(cfg: dict[str, Any]) -> dict[str, Any]:
-    train_cfg_path = cfg.get("train_config_path")
-    if not train_cfg_path:
-        return cfg
-
-    resolved = resolve_optional_path(str(train_cfg_path))
-    if not resolved.exists():
-        raise FileNotFoundError(f"Referenced train config not found: {train_cfg_path}")
-
-    train_cfg = load_config(resolved)
-    for key in (
-        "output_dir",
-        "processed_data_dir",
-        "load_in_4bit",
-        "custom_special_tokens",
-        "model_name",
-        "max_seq_length",
-    ):
-        if key not in cfg and key in train_cfg:
-            cfg[key] = train_cfg[key]
-    return cfg

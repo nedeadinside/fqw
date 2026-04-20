@@ -1,0 +1,21 @@
+profiles_dir: "configs/profiles"
+
+profiles:
+  model: "qwen25_3b"
+  training: "default"
+  inference: "default"
+  evaluation: "default"
+
+experiment:
+  id_mode: "auto"
+  id: ""
+  prefix: "nl2sql"
+  artifacts_root: "./artifacts/experiments"
+  include_profiles_in_id: true
+
+paths:
+  chat_template: "templates/qwen_chat_template.jinja"
+  processed_data_dir: "./processed_data"
+  spider_db_dir: "./raw_data/Spider/database"
+  spider_test_db_dir: "./raw_data/Spider/test_database"
+  spider_tables_json: "./raw_data/Spider/tables.json"

@@ -1,22 +1,21 @@
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from src.data.dataset import load_jsonl, stratified_dev_split
+from src.data.dataset import load_jsonl
 from src.evaluation.generate import (
     generate_predictions,
-    load_vllm_engine,
+    load_model,
     setup_tokenizer,
 )
 
 
-def load_eval_samples(processed_data_dir: str, num_samples: int) -> list[dict]:
+def load_eval_samples(
+    processed_data_dir: str, split: str, num_samples: int
+) -> list[dict]:
     data_dir = Path(processed_data_dir)
-    spider_val, _ = stratified_dev_split(load_jsonl(data_dir / "spider_dev.jsonl"))
-    return spider_val[:num_samples]
+    records = load_jsonl(data_dir / f"{split}.jsonl")
+    return records[:num_samples]
 
 
 def print_inference_results(predictions: list[dict]) -> None:
@@ -44,28 +43,17 @@ def main(
     chat_template_path: str | None,
     max_new_tokens: int,
     max_input_length: int,
-    tensor_parallel_size: int,
-    gpu_memory_utilization: float,
-    max_model_len: int | None,
-    vllm_dtype: str,
-    max_lora_rank: int,
+    split: str,
+    load_in_4bit: bool,
 ) -> None:
     tokenizer = setup_tokenizer(model_path, chat_template_path=chat_template_path)
-    llm, lora_request = load_vllm_engine(
-        model_path=model_path,
-        tensor_parallel_size=tensor_parallel_size,
-        gpu_memory_utilization=gpu_memory_utilization,
-        max_model_len=max_model_len,
-        dtype=vllm_dtype,
-        max_lora_rank=max_lora_rank,
-    )
+    model = load_model(model_path, tokenizer, load_in_4bit=load_in_4bit)
 
-    records = load_eval_samples(processed_data_dir, num_samples)
+    records = load_eval_samples(processed_data_dir, split, num_samples)
     predictions = generate_predictions(
         records=records,
-        llm=llm,
+        model=model,
         tokenizer=tokenizer,
-        lora_request=lora_request,
         max_new_tokens=max_new_tokens,
         max_input_length=max_input_length,
     )
@@ -73,17 +61,14 @@ def main(
 
 
 if __name__ == "__main__":
-    MODEL_PATH = "./results/checkpoints/E2/best"
+    MODEL_PATH = "./artifacts/experiments/E2/checkpoints/best"
     NUM_SAMPLES = 2
     PROCESSED_DATA_DIR = "./processed_data"
     CHAT_TEMPLATE_PATH: str | None = "templates/qwen_chat_template.jinja"
     MAX_NEW_TOKENS = 512
     MAX_INPUT_LENGTH = 4096
-    TENSOR_PARALLEL_SIZE = 1
-    GPU_MEMORY_UTILIZATION = 0.9
-    MAX_MODEL_LEN: int | None = 4096
-    VLLM_DTYPE = "bfloat16"
-    MAX_LORA_RANK = 64
+    SPLIT = "val"
+    LOAD_IN_4BIT = False
 
     main(
         model_path=MODEL_PATH,
@@ -92,9 +77,6 @@ if __name__ == "__main__":
         chat_template_path=CHAT_TEMPLATE_PATH,
         max_new_tokens=MAX_NEW_TOKENS,
         max_input_length=MAX_INPUT_LENGTH,
-        tensor_parallel_size=TENSOR_PARALLEL_SIZE,
-        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
-        max_model_len=MAX_MODEL_LEN,
-        vllm_dtype=VLLM_DTYPE,
-        max_lora_rank=MAX_LORA_RANK,
+        split=SPLIT,
+        load_in_4bit=LOAD_IN_4BIT,
     )

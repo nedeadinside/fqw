@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 from typing import Any
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.data.dataset import build_db_path_index, load_jsonl
 from src.evaluation._config import (
@@ -30,16 +27,24 @@ def _save_metrics(metrics: dict, path: Path) -> None:
 
 def _metrics_output_path(cfg: dict[str, Any], predictions_path: Path) -> Path:
     if "metrics_path" in cfg:
-        return Path(cfg["metrics_path"])
-    results_dir = Path(cfg.get("results_dir", "./results"))
+        return resolve_optional_path(str(cfg["metrics_path"]))
+    results_dir = resolve_optional_path(str(cfg.get("results_dir", "./results")))
     stem = predictions_path.stem
     if stem.endswith("_predictions"):
         stem = stem[: -len("_predictions")]
     return results_dir / "metrics" / f"{stem}_metrics.json"
 
 
-def evaluate(config_path: str) -> dict:
-    cfg = load_config(resolve_config_path(config_path))
+def evaluate(
+    config_path: str | None = None,
+    cfg_override: dict[str, Any] | None = None,
+) -> dict:
+    if cfg_override is not None:
+        cfg = dict(cfg_override)
+    else:
+        if config_path is None:
+            raise ValueError("Either config_path or cfg_override must be provided")
+        cfg = load_config(resolve_config_path(config_path))
 
     missing = [k for k in REQUIRED_CONFIG_KEYS if k not in cfg]
     if missing:
@@ -73,6 +78,6 @@ def evaluate(config_path: str) -> dict:
 
 
 if __name__ == "__main__":
-    EVAL_CONFIG_PATH = "/home/matvey/projects/fqw/configs/eval_qwen.yaml"
+    EVAL_CONFIG_PATH = "configs/eval_qwen.yaml"
     metrics = evaluate(config_path=EVAL_CONFIG_PATH)
     print(json.dumps(metrics, ensure_ascii=False, indent=2))

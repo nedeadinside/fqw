@@ -1,0 +1,4 @@
+model:
+  name: "Qwen/Qwen2.5-3B"
+  max_seq_length: 4096
+  load_in_4bit: true

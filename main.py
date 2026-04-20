@@ -6,151 +6,308 @@ import sys
 from pathlib import Path
 from typing import Any
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+from src.config import (
+    parse_profile_overrides,
+    resolve_pipeline,
+    resolve_project_path,
+    save_effective_config,
+    update_manifest,
+)
+from src.config.pipeline import ExperimentPaths
 
-TRAIN_CONFIG_PATH = "configs/train_qwen_2-5-3b.yaml"
-GENERATE_CONFIG_PATH = "configs/generate_qwen.yaml"
-EVAL_CONFIG_PATH = "configs/eval_qwen.yaml"
-CHAT_TEMPLATE_PATH = "templates/qwen_chat_template.jinja"
-RUN_ID = "E2"
-
-
-def _resolve_project_path(path: str) -> Path:
-    candidate = Path(path)
-    if candidate.exists():
-        return candidate
-
-    project_candidate = PROJECT_ROOT / path
-    if project_candidate.exists():
-        return project_candidate
-
-    return candidate
+DEFAULT_PIPELINE_PATH = "configs/pipeline.yaml"
 
 
-def _require_file(path: str, label: str) -> Path:
-    resolved = _resolve_project_path(path)
-    if not resolved.exists():
+def _require_file(path: Path, label: str) -> Path:
+    if not path.exists():
         raise FileNotFoundError(f"{label} not found: {path}")
-    return resolved
+    return path
 
 
-def _build_metrics_path(eval_cfg: dict[str, Any], predictions_path: Path) -> Path:
-    if "metrics_path" in eval_cfg:
-        return _resolve_project_path(str(eval_cfg["metrics_path"]))
-
-    results_dir = _resolve_project_path(str(eval_cfg.get("results_dir", "./results")))
-    stem = predictions_path.stem
-    if stem.endswith("_predictions"):
-        stem = stem[: -len("_predictions")]
-    return results_dir / "metrics" / f"{stem}_metrics.json"
+def _resolve_chat_template(effective_cfg: dict[str, Any]) -> str | None:
+    template_value = effective_cfg.get("paths", {}).get("chat_template")
+    if not template_value:
+        return None
+    template_path = resolve_project_path(str(template_value))
+    _require_file(template_path, "Chat template")
+    return str(template_path)
 
 
-def _preflight_train() -> None:
-    _require_file(TRAIN_CONFIG_PATH, "Train config")
-    _require_file(CHAT_TEMPLATE_PATH, "Chat template")
+def _resolve_processed_data_dir(effective_cfg: dict[str, Any]) -> Path:
+    processed_data_dir = effective_cfg.get("paths", {}).get(
+        "processed_data_dir", "./processed_data"
+    )
+    path = resolve_project_path(str(processed_data_dir))
+    if not path.exists():
+        raise FileNotFoundError(f"Processed data dir not found: {path}")
+    return path
 
 
-def _preflight_generate() -> None:
-    _require_file(GENERATE_CONFIG_PATH, "Generate config")
-    _require_file(CHAT_TEMPLATE_PATH, "Chat template")
+def _build_train_cfg(
+    effective_cfg: dict[str, Any],
+    experiment_paths: ExperimentPaths,
+) -> dict[str, Any]:
+    train_cfg = dict(effective_cfg.get("train", {}))
+    model_cfg = effective_cfg.get("model", {})
+
+    model_name = model_cfg.get("name")
+    if not model_name:
+        raise ValueError("Model profile must define model.name")
+
+    train_cfg["model_name"] = model_name
+    train_cfg["max_seq_length"] = model_cfg.get(
+        "max_seq_length", train_cfg.get("max_seq_length", 2048)
+    )
+    train_cfg["load_in_4bit"] = model_cfg.get(
+        "load_in_4bit", train_cfg.get("load_in_4bit", True)
+    )
+    train_cfg["processed_data_dir"] = str(_resolve_processed_data_dir(effective_cfg))
+    train_cfg["checkpoint_dir"] = str(experiment_paths.checkpoints_dir)
+
+    return train_cfg
 
 
-def _preflight_test() -> tuple[dict[str, Any], Path, Path]:
-    from src.evaluation._config import load_config
+def _build_generate_cfg(
+    effective_cfg: dict[str, Any],
+    experiment_paths: ExperimentPaths,
+    split_override: str | None,
+) -> tuple[dict[str, Any], str]:
+    generate_cfg = dict(effective_cfg.get("generate", {}))
+    model_cfg = effective_cfg.get("model", {})
+    train_cfg = dict(effective_cfg.get("train", {}))
 
-    config_file = _require_file(EVAL_CONFIG_PATH, "Eval config")
-    cfg = load_config(config_file)
+    split = split_override or str(generate_cfg.get("split", "test"))
+    generate_cfg["split"] = split
 
-    predictions_raw = cfg.get("predictions_path")
-    if not predictions_raw:
-        raise ValueError("Eval config must contain 'predictions_path'")
+    generate_cfg["processed_data_dir"] = str(_resolve_processed_data_dir(effective_cfg))
+    generate_cfg["load_in_4bit"] = model_cfg.get(
+        "load_in_4bit", generate_cfg.get("load_in_4bit", False)
+    )
 
-    predictions_path = _resolve_project_path(str(predictions_raw))
-    if not predictions_path.exists():
-        raise FileNotFoundError(
-            "Predictions file configured for test command was not found: "
-            f"{predictions_raw}"
+    custom_tokens = train_cfg.get("custom_special_tokens")
+    if custom_tokens:
+        generate_cfg["custom_special_tokens"] = custom_tokens
+
+    if "model_path" not in generate_cfg:
+        generate_cfg["best_model_dir"] = str(experiment_paths.best_model_dir)
+
+    generate_cfg["predictions_path"] = str(experiment_paths.prediction_path(split))
+
+    return generate_cfg, split
+
+
+def _build_evaluate_cfg(
+    effective_cfg: dict[str, Any],
+    experiment_paths: ExperimentPaths,
+    split: str,
+) -> dict[str, Any]:
+    evaluate_cfg = dict(effective_cfg.get("evaluate", {}))
+    paths_cfg = effective_cfg.get("paths", {})
+
+    spider_db_dir = resolve_project_path(
+        str(paths_cfg.get("spider_db_dir", "./raw_data/Spider/database"))
+    )
+    spider_test_db_dir = resolve_project_path(
+        str(paths_cfg.get("spider_test_db_dir", "./raw_data/Spider/test_database"))
+    )
+
+    if not spider_db_dir.exists():
+        raise FileNotFoundError(f"Spider db dir not found: {spider_db_dir}")
+    if not spider_test_db_dir.exists():
+        raise FileNotFoundError(f"Spider test db dir not found: {spider_test_db_dir}")
+
+    evaluate_cfg["predictions_path"] = str(experiment_paths.prediction_path(split))
+    evaluate_cfg["metrics_path"] = str(experiment_paths.metrics_path(split))
+    evaluate_cfg["results_dir"] = str(experiment_paths.root)
+    evaluate_cfg["spider_db_dir"] = str(spider_db_dir)
+    evaluate_cfg["spider_test_db_dir"] = str(spider_test_db_dir)
+
+    spider_tables_json = paths_cfg.get("spider_tables_json")
+    if spider_tables_json:
+        evaluate_cfg["spider_tables_json"] = str(
+            resolve_project_path(str(spider_tables_json))
         )
 
-    metrics_path = _build_metrics_path(cfg, predictions_path)
-    return cfg, predictions_path, metrics_path
+    return evaluate_cfg
 
 
-def _run_train() -> int:
-    _preflight_train()
-
+def _run_train_stage(
+    effective_cfg: dict[str, Any],
+    experiment_paths: ExperimentPaths,
+    chat_template_path: str | None,
+) -> Path:
     from src.training.train import train
 
-    best_checkpoint = train(
-        config_path=TRAIN_CONFIG_PATH,
-        chat_template_path=CHAT_TEMPLATE_PATH,
-        run_id=RUN_ID,
+    train_cfg = _build_train_cfg(effective_cfg, experiment_paths)
+    best_checkpoint = Path(
+        train(
+            chat_template_path=chat_template_path,
+            run_id="",
+            cfg_override=train_cfg,
+        )
     )
-    print(f"Train finished. Best checkpoint: {best_checkpoint}")
-    return 0
+
+    update_manifest(
+        experiment_paths,
+        "train",
+        {
+            "status": "completed",
+            "checkpoint_dir": str(experiment_paths.checkpoints_dir),
+            "best_model_dir": str(best_checkpoint),
+        },
+    )
+    return best_checkpoint
 
 
-def _run_generate() -> int:
-    _preflight_generate()
-
+def _run_generate_stage(
+    effective_cfg: dict[str, Any],
+    experiment_paths: ExperimentPaths,
+    chat_template_path: str | None,
+    split_override: str | None,
+) -> tuple[Path, str]:
     from src.evaluation.generate import generate
 
-    predictions_path = generate(
-        config_path=GENERATE_CONFIG_PATH,
-        chat_template_path=CHAT_TEMPLATE_PATH,
-        run_id=RUN_ID,
+    generate_cfg, split = _build_generate_cfg(
+        effective_cfg,
+        experiment_paths,
+        split_override=split_override,
     )
-    print(f"Generate finished. Predictions saved to: {predictions_path}")
-    return 0
+
+    if (
+        "model_path" not in generate_cfg
+        and not experiment_paths.best_model_dir.exists()
+    ):
+        raise FileNotFoundError(
+            "Best model checkpoint not found for generation. "
+            f"Expected: {experiment_paths.best_model_dir}"
+        )
+
+    predictions_path = generate(
+        chat_template_path=chat_template_path,
+        run_id="",
+        cfg_override=generate_cfg,
+    )
+
+    update_manifest(
+        experiment_paths,
+        "generate",
+        {
+            "status": "completed",
+            "split": split,
+            "predictions_path": str(predictions_path),
+        },
+    )
+    return predictions_path, split
 
 
-def _run_test() -> int:
-    cfg, predictions_path, metrics_path = _preflight_test()
-
+def _run_test_stage(
+    effective_cfg: dict[str, Any],
+    experiment_paths: ExperimentPaths,
+    split: str,
+) -> dict[str, Any]:
     from src.evaluation.evaluate import evaluate
 
-    metrics = evaluate(config_path=EVAL_CONFIG_PATH)
+    evaluate_cfg = _build_evaluate_cfg(effective_cfg, experiment_paths, split)
+    predictions_path = Path(evaluate_cfg["predictions_path"])
+    if not predictions_path.exists():
+        raise FileNotFoundError(
+            f"Predictions file not found for evaluation. Expected: {predictions_path}"
+        )
 
-    summary = {
-        "ex_strict": metrics.get("ex_strict"),
-        "ex_permuted": metrics.get("ex_permuted"),
-        "em": metrics.get("em"),
-        "vsr": metrics.get("vsr"),
-        "n_examples": metrics.get("n_examples"),
-        "predictions_path": str(predictions_path),
-        "metrics_path": str(metrics_path),
+    metrics = evaluate(cfg_override=evaluate_cfg)
+
+    update_manifest(
+        experiment_paths,
+        "evaluate",
+        {
+            "status": "completed",
+            "split": split,
+            "metrics_path": str(experiment_paths.metrics_path(split)),
+            "summary": {
+                "ex_strict": metrics.get("ex_strict"),
+                "ex_permuted": metrics.get("ex_permuted"),
+                "em": metrics.get("em"),
+                "vsr": metrics.get("vsr"),
+                "n_examples": metrics.get("n_examples"),
+            },
+        },
+    )
+
+    return metrics
+
+
+def _print_dry_run(
+    effective_cfg: dict[str, Any],
+    experiment_paths: ExperimentPaths,
+) -> None:
+    payload = {
+        "experiment_id": experiment_paths.experiment_id,
+        "paths": {
+            "root": str(experiment_paths.root),
+            "checkpoints": str(experiment_paths.checkpoints_dir),
+            "best_model": str(experiment_paths.best_model_dir),
+            "predictions": str(experiment_paths.predictions_dir),
+            "metrics": str(experiment_paths.metrics_dir),
+            "manifest": str(experiment_paths.manifest_path),
+        },
+        "profiles": effective_cfg.get("profiles", {}),
+        "meta": effective_cfg.get("_meta", {}),
     }
-
-    split_hint = cfg.get("split")
-    if split_hint is not None:
-        summary["split"] = split_hint
-
-    print("Test finished. Metrics summary:")
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
-            "Unified entry point for FQW pipeline. "
-            "Uses default YAML configs and run id."
-        )
+        description="Unified pipeline launcher with pipeline+profiles configuration model."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser(
-        "train",
-        help="Run training with default train config.",
-    )
-    subparsers.add_parser(
-        "generate",
-        help="Generate predictions with default generate config.",
-    )
-    subparsers.add_parser(
-        "test",
-        help="Run evaluation metrics with default eval config.",
-    )
+    def add_common_options(target: argparse.ArgumentParser) -> None:
+        target.add_argument(
+            "--pipeline",
+            default=DEFAULT_PIPELINE_PATH,
+            help="Path to pipeline YAML config.",
+        )
+        target.add_argument(
+            "--profile",
+            action="append",
+            default=[],
+            help=(
+                "Profile override in form kind=name. "
+                "Can be repeated, e.g. --profile model=qwen25_7b_coder"
+            ),
+        )
+        target.add_argument(
+            "--experiment-id",
+            default=None,
+            help="Force experiment ID. Recommended for standalone generate/test.",
+        )
+        target.add_argument(
+            "--id-mode",
+            choices=["auto", "manual"],
+            default=None,
+            help="Override experiment id mode from pipeline config.",
+        )
+        target.add_argument(
+            "--split",
+            default=None,
+            help="Override generation/evaluation split.",
+        )
+        target.add_argument(
+            "--dry-run-config",
+            action="store_true",
+            help="Resolve pipeline and print effective runtime context without running stages.",
+        )
+
+    train_parser = subparsers.add_parser("train", help="Run training stage.")
+    generate_parser = subparsers.add_parser("generate", help="Run generation stage.")
+    test_parser = subparsers.add_parser("test", help="Run evaluation stage.")
+    all_parser = subparsers.add_parser("all", help="Run train -> generate -> test.")
+
+    add_common_options(train_parser)
+    add_common_options(generate_parser)
+    add_common_options(test_parser)
+    add_common_options(all_parser)
 
     return parser
 
@@ -159,18 +316,102 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    handlers = {
-        "train": _run_train,
-        "generate": _run_generate,
-        "test": _run_test,
-    }
-
-    handler = handlers.get(args.command)
-    if handler is None:
-        parser.error(f"Unknown command: {args.command}")
-
     try:
-        return handler()
+        profile_overrides = parse_profile_overrides(args.profile)
+        effective_cfg, experiment_paths = resolve_pipeline(
+            pipeline_path=args.pipeline,
+            profile_overrides=profile_overrides,
+            experiment_id_override=args.experiment_id,
+            id_mode_override=args.id_mode,
+        )
+
+        experiment_paths.ensure_directories()
+        save_effective_config(effective_cfg, experiment_paths)
+        chat_template_path = _resolve_chat_template(effective_cfg)
+
+        if args.dry_run_config:
+            _print_dry_run(effective_cfg, experiment_paths)
+            return 0
+
+        if args.command == "train":
+            best_checkpoint = _run_train_stage(
+                effective_cfg,
+                experiment_paths,
+                chat_template_path,
+            )
+            print(f"Train finished. Best checkpoint: {best_checkpoint}")
+            return 0
+
+        if args.command == "generate":
+            predictions_path, split = _run_generate_stage(
+                effective_cfg,
+                experiment_paths,
+                chat_template_path,
+                split_override=args.split,
+            )
+            print(
+                f"Generate finished for split '{split}'. Predictions: {predictions_path}"
+            )
+            return 0
+
+        if args.command == "test":
+            split = args.split or str(
+                effective_cfg.get("generate", {}).get("split", "test")
+            )
+            metrics = _run_test_stage(
+                effective_cfg,
+                experiment_paths,
+                split=split,
+            )
+            print("Test finished. Metrics summary:")
+            print(
+                json.dumps(
+                    {
+                        "split": split,
+                        "ex_strict": metrics.get("ex_strict"),
+                        "ex_permuted": metrics.get("ex_permuted"),
+                        "em": metrics.get("em"),
+                        "vsr": metrics.get("vsr"),
+                        "n_examples": metrics.get("n_examples"),
+                        "metrics_path": str(experiment_paths.metrics_path(split)),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+
+        if args.command == "all":
+            _run_train_stage(effective_cfg, experiment_paths, chat_template_path)
+            predictions_path, split = _run_generate_stage(
+                effective_cfg,
+                experiment_paths,
+                chat_template_path,
+                split_override=args.split,
+            )
+            metrics = _run_test_stage(effective_cfg, experiment_paths, split=split)
+
+            print("Pipeline finished.")
+            print(
+                json.dumps(
+                    {
+                        "experiment_id": experiment_paths.experiment_id,
+                        "split": split,
+                        "predictions_path": str(predictions_path),
+                        "metrics_path": str(experiment_paths.metrics_path(split)),
+                        "ex_strict": metrics.get("ex_strict"),
+                        "ex_permuted": metrics.get("ex_permuted"),
+                        "em": metrics.get("em"),
+                        "vsr": metrics.get("vsr"),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+
+        parser.error(f"Unknown command: {args.command}")
+        return 2
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
