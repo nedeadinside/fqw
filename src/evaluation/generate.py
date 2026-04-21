@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -53,16 +54,27 @@ def make_inference_prompt(example: dict, tokenizer) -> str:
     )
 
 
-def extract_sql(generated_text: str) -> str:
-    sql = generated_text
-    if "<|im_start|>assistant" in sql:
-        sql = sql.split("<|im_start|>assistant")[-1]
-
+def _extract_assistant_text(generated_text: str) -> str:
+    text = generated_text
+    if "<|im_start|>assistant" in text:
+        text = text.split("<|im_start|>assistant")[-1]
     for stop in SQL_STOP_TOKENS:
-        if stop in sql:
-            sql = sql[: sql.index(stop)]
+        if stop in text:
+            text = text[: text.index(stop)]
+    return text.strip()
 
-    sql = sql.strip()
+
+def extract_evidence(assistant_text: str) -> str:
+    m = re.search(r"<evidence>(.*?)</evidence>", assistant_text, flags=re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+
+def extract_sql(generated_text: str, strip_evidence: bool = False) -> str:
+    sql = _extract_assistant_text(generated_text)
+
+    if strip_evidence:
+        sql = re.sub(r"<evidence>.*?</evidence>\s*", "", sql, flags=re.DOTALL).strip()
+
     if sql.startswith("```"):
         lines = sql.split("\n")
         inner = lines[1:]
@@ -142,6 +154,7 @@ def generate_predictions(
     do_sample: bool = False,
     num_beams: int = 1,
     seed: int = 42,
+    strip_evidence: bool = False,
 ) -> list[dict]:
     model.eval()
     torch.manual_seed(seed)
@@ -169,6 +182,7 @@ def generate_predictions(
             outputs = model.generate(**inputs, **generation_config)
 
         decoded = tokenizer.decode(outputs[0], skip_special_tokens=False)
+        assistant_text = _extract_assistant_text(decoded)
         predictions.append(
             {
                 "example_id": ex.get("example_id", f"{i}"),
@@ -176,7 +190,8 @@ def generate_predictions(
                 "db_id": ex["db_id"],
                 "question": ex["question"],
                 "gold_sql": ex["sql"],
-                "predicted_sql": extract_sql(decoded),
+                "predicted_evidence": extract_evidence(assistant_text),
+                "predicted_sql": extract_sql(decoded, strip_evidence=strip_evidence),
             }
         )
 
@@ -270,6 +285,7 @@ def generate(
         do_sample=cfg.get("do_sample", False),
         num_beams=cfg.get("num_beams", 1),
         seed=cfg.get("seed", 42),
+        strip_evidence=cfg.get("strip_evidence", False),
     )
 
     if "predictions_path" in cfg:

@@ -31,6 +31,9 @@ def print_inference_results(predictions: list[dict]) -> None:
         print(f"Database: {pred['db_id']}")
         print(f"\nQuestion:\n  {pred['question']}")
         print(f"\nGold SQL:\n  {pred['gold_sql']}")
+        evidence = pred.get("predicted_evidence", "")
+        if evidence:
+            print(f"\nPredicted Evidence:\n  {evidence}")
         print(f"\nPredicted SQL:\n  {pred['predicted_sql']}")
         print(f"\nStatus: {match}\n{'-' * 140}\n")
     print(sep)
@@ -45,6 +48,7 @@ def main(
     max_input_length: int,
     split: str,
     load_in_4bit: bool,
+    strip_evidence: bool = False,
 ) -> None:
     tokenizer = setup_tokenizer(model_path, chat_template_path=chat_template_path)
     model = load_model(model_path, tokenizer, load_in_4bit=load_in_4bit)
@@ -56,6 +60,7 @@ def main(
         tokenizer=tokenizer,
         max_new_tokens=max_new_tokens,
         max_input_length=max_input_length,
+        strip_evidence=strip_evidence,
     )
     print_inference_results(predictions)
 
@@ -69,6 +74,7 @@ if __name__ == "__main__":
     MAX_INPUT_LENGTH = 4096
     SPLIT = "val"
     LOAD_IN_4BIT = False
+    STRIP_EVIDENCE = False
 
     main(
         model_path=MODEL_PATH,
@@ -79,4 +85,5 @@ if __name__ == "__main__":
         max_input_length=MAX_INPUT_LENGTH,
         split=SPLIT,
         load_in_4bit=LOAD_IN_4BIT,
+        strip_evidence=STRIP_EVIDENCE,
     )

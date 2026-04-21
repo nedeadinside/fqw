@@ -94,6 +94,9 @@ def _build_generate_cfg(
 
     generate_cfg["predictions_path"] = str(experiment_paths.prediction_path(split))
 
+    if effective_cfg.get("profiles", {}).get("training") == "evidence":
+        generate_cfg["strip_evidence"] = True
+
     return generate_cfg, split
 
 
