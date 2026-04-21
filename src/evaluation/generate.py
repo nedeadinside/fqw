@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from tqdm.auto import tqdm
 
 from src.data.dataset import (
     CUSTOM_SPECIAL_TOKENS,
@@ -172,7 +173,13 @@ def generate_predictions(
     )
 
     predictions: list[dict] = []
-    for start in range(0, len(records), batch_size):
+    pbar = tqdm(
+        range(0, len(records), batch_size),
+        total=(len(records) + batch_size - 1) // batch_size,
+        desc="generate",
+        unit="batch",
+    )
+    for start in pbar:
         batch = records[start : start + batch_size]
         prompts = [make_inference_prompt(ex, tokenizer) for ex in batch]
         inputs = tokenizer(
@@ -200,7 +207,9 @@ def generate_predictions(
                     "question": ex["question"],
                     "gold_sql": ex["sql"],
                     "predicted_evidence": extract_evidence(assistant_text),
-                    "predicted_sql": extract_sql(decoded, strip_evidence=strip_evidence),
+                    "predicted_sql": extract_sql(
+                        decoded, strip_evidence=strip_evidence
+                    ),
                 }
             )
 
