@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -14,83 +15,125 @@ from src.evaluation.spider_eval_utils import (
     Evaluator,
     build_foreign_key_map_from_json,
     build_valid_col_units,
-    eval_exec_match,
+    eval_exec_match_from_rows,
     rebuild_sql_col,
     rebuild_sql_val,
 )
 from src.evaluation.spider_process_sql import Schema, get_schema, get_sql
 from src.evaluation.sql_executor import (
+    ExecutionResult,
+    Rows,
     execute_sql,
     results_match,
     results_match_permuted,
 )
 
+ExecCache = Dict[Tuple[str, str], ExecutionResult]
+
+
+_STRING_LITERAL_RE = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
+
 
 def normalize_sql(sql: str) -> str:
-    sql = sql.lower().strip()
-    if sql.endswith(";"):
-        sql = sql[:-1].rstrip()
-    return " ".join(sql.split())
+    placeholders: List[str] = []
+
+    def _stash(match: re.Match) -> str:
+        placeholders.append(match.group(0))
+        return f"\x00{len(placeholders) - 1}\x00"
+
+    masked = _STRING_LITERAL_RE.sub(_stash, sql)
+    masked = masked.lower().strip()
+    if masked.endswith(";"):
+        masked = masked[:-1].rstrip()
+    masked = " ".join(masked.split())
+
+    def _restore(match: re.Match) -> str:
+        return placeholders[int(match.group(1))]
+
+    return re.sub(r"\x00(\d+)\x00", _restore, masked)
 
 
-def _ex_with_matcher(
+def _cache_key(db_id: str, sql: str) -> Tuple[str, str]:
+    return db_id, (sql or "").strip()
+
+
+def _run_cached(
+    cache: ExecCache,
+    db_id: str,
+    db_path: str,
+    sql: str,
+    timeout: float,
+    error_stage: str,
+    error_kind: str,
+) -> ExecutionResult:
+    key = _cache_key(db_id, sql)
+    if key in cache:
+        return cache[key]
+    result, err = execute_sql(db_path, sql, timeout)
+    cache[key] = (result, err)
+    if err is not None:
+        log_metric_error(
+            "stage=%s | kind=%s | db_id=%s | error=%s | sql=%s",
+            error_stage,
+            error_kind,
+            db_id,
+            err,
+            sql,
+        )
+    return cache[key]
+
+
+def _build_exec_cache(
     predictions: List[dict],
     db_paths: Dict[str, str],
     timeout: float,
-    matcher,
-    desc: str = "execution accuracy",
-) -> Tuple[float, List[bool]]:
-    correct_flags = []
-    for pred in tqdm(predictions, desc=desc, unit="q"):
+) -> ExecCache:
+    cache: ExecCache = {}
+    for pred in tqdm(predictions, desc="exec_sql", unit="q"):
         db_id = pred.get("db_id", "")
-        db_path = db_paths.get(pred["db_id"], "")
-        pred_result, pred_err = execute_sql(db_path, pred["predicted_sql"], timeout)
-        gold_result, gold_err = execute_sql(db_path, pred["gold_sql"], timeout)
-
-        if pred_err is not None:
-            log_metric_error(
-                "stage=%s | kind=pred_sql_exec_error | db_id=%s | error=%s | sql=%s",
-                desc,
-                db_id,
-                pred_err,
-                pred["predicted_sql"],
-            )
-        if gold_err is not None:
-            log_metric_error(
-                "stage=%s | kind=gold_sql_exec_error | db_id=%s | error=%s | sql=%s",
-                desc,
-                db_id,
-                gold_err,
-                pred["gold_sql"],
-            )
-
-        is_correct = (
-            pred_err is None and gold_err is None and matcher(pred_result, gold_result)
+        db_path = db_paths.get(db_id, "")
+        _run_cached(
+            cache, db_id, db_path, pred["predicted_sql"], timeout,
+            error_stage="exec", error_kind="pred_sql_exec_error",
         )
-        correct_flags.append(is_correct)
+        _run_cached(
+            cache, db_id, db_path, pred["gold_sql"], timeout,
+            error_stage="exec", error_kind="gold_sql_exec_error",
+        )
+    return cache
 
-    score = sum(correct_flags) / len(correct_flags) if correct_flags else 0.0
-    return score, correct_flags
+
+def _pair_from_cache(cache: ExecCache, pred: dict) -> Tuple[Rows, Optional[str], Rows, Optional[str]]:
+    db_id = pred.get("db_id", "")
+    p_rows, p_err = cache.get(_cache_key(db_id, pred["predicted_sql"]), (None, "missing"))
+    g_rows, g_err = cache.get(_cache_key(db_id, pred["gold_sql"]), (None, "missing"))
+    return p_rows, p_err, g_rows, g_err
 
 
 def execution_accuracy(
     predictions: List[dict],
-    db_paths: Dict[str, str],
-    timeout: float = 30.0,
+    cache: ExecCache,
 ) -> Tuple[float, List[bool]]:
-    return _ex_with_matcher(
-        predictions, db_paths, timeout, results_match, desc="ex_strict"
-    )
+    flags: List[bool] = []
+    for pred in predictions:
+        p_rows, p_err, g_rows, g_err = _pair_from_cache(cache, pred)
+        ok = p_err is None and g_err is None and results_match(p_rows, g_rows, pred["gold_sql"])
+        flags.append(ok)
+    score = sum(flags) / len(flags) if flags else 0.0
+    return score, flags
 
 
 def execution_accuracy_permuted(
     predictions: List[dict],
-    db_paths: Dict[str, str],
-    timeout: float = 30.0,
+    cache: ExecCache,
 ) -> Tuple[float, List[bool]]:
-    return _ex_with_matcher(
-        predictions, db_paths, timeout, results_match_permuted, desc="ex_permuted"
-    )
+    flags: List[bool] = []
+    for pred in predictions:
+        p_rows, p_err, g_rows, g_err = _pair_from_cache(cache, pred)
+        ok = p_err is None and g_err is None and results_match_permuted(p_rows, g_rows)
+        flags.append(ok)
+    score = sum(flags) / len(flags) if flags else 0.0
+    return score, flags
 
 
 def exact_match(predictions: List[dict]) -> Tuple[float, List[bool]]:
@@ -104,25 +147,15 @@ def exact_match(predictions: List[dict]) -> Tuple[float, List[bool]]:
 
 def valid_sql_rate(
     predictions: List[dict],
-    db_paths: Dict[str, str],
-    timeout: float = 30.0,
+    cache: ExecCache,
 ) -> Tuple[float, List[bool]]:
-    valid_flags = []
-    for pred in tqdm(predictions, desc="valid_sql_rate", unit="q"):
+    flags: List[bool] = []
+    for pred in predictions:
         db_id = pred.get("db_id", "")
-        db_path = db_paths.get(pred["db_id"], "")
-        _, err = execute_sql(db_path, pred["predicted_sql"], timeout)
-        if err is not None:
-            log_metric_error(
-                "stage=valid_sql_rate | kind=pred_sql_exec_error | db_id=%s | error=%s | sql=%s",
-                db_id,
-                err,
-                pred["predicted_sql"],
-            )
-        valid_flags.append(err is None)
-
-    score = sum(valid_flags) / len(valid_flags) if valid_flags else 0.0
-    return score, valid_flags
+        _, err = cache.get(_cache_key(db_id, pred["predicted_sql"]), (None, "missing"))
+        flags.append(err is None)
+    score = sum(flags) / len(flags) if flags else 0.0
+    return score, flags
 
 
 def _breakdown_by_source(
@@ -147,7 +180,6 @@ def _load_spider_fk_maps(tables_json: str) -> tuple[Dict[str, dict], List[str]]:
     primary = Path(tables_json)
     candidates = [primary]
 
-    # Spider test DB metadata is stored in a separate file.
     test_tables = primary.with_name("test_tables.json")
     if test_tables not in candidates and test_tables.exists():
         candidates.append(test_tables)
@@ -172,6 +204,7 @@ def compute_spider_component_metrics(
     predictions: List[dict],
     db_paths: Dict[str, str],
     tables_json: str,
+    cache: ExecCache,
 ) -> dict:
     spider_preds = [p for p in predictions if p.get("source") == "spider"]
     if not spider_preds:
@@ -205,6 +238,7 @@ def compute_spider_component_metrics(
                 "rec_count": 0,
             }
 
+    schema_cache: Dict[str, Schema] = {}
     evaluator = Evaluator()
     for pred in tqdm(spider_preds, desc="spider_official", unit="q"):
         db_name = pred["db_id"]
@@ -213,7 +247,10 @@ def compute_spider_component_metrics(
             raise FileNotFoundError(
                 f"SQLite file for db_id '{db_name}' was not found in configured database directories"
             )
-        schema = Schema(get_schema(db_path))
+        schema = schema_cache.get(db_name)
+        if schema is None:
+            schema = Schema(get_schema(db_path))
+            schema_cache[db_name] = schema
 
         g_sql = get_sql(schema, pred["gold_sql"])
         hardness = evaluator.eval_hardness(g_sql)
@@ -252,9 +289,11 @@ def compute_spider_component_metrics(
         p_valid = build_valid_col_units(p_sql["from"]["table_units"], schema)
         p_sql = rebuild_sql_col(p_valid, rebuild_sql_val(p_sql), kmap)
 
-        exec_score = eval_exec_match(
-            db_path, pred["predicted_sql"], pred["gold_sql"], p_sql, g_sql
-        )
+        p_rows, p_err, g_rows, g_err = _pair_from_cache(cache, pred)
+        if p_err is not None or g_err is not None:
+            exec_score = False
+        else:
+            exec_score = eval_exec_match_from_rows(p_rows, g_rows, p_sql, g_sql)
         if exec_score:
             scores[hardness]["exec"] += 1.0
             scores["all"]["exec"] += 1.0
@@ -308,12 +347,12 @@ def compute_all_metrics(
 ) -> dict:
     configure_metrics_error_log(metrics_errors_log_path)
     try:
-        ex, ex_flags = execution_accuracy(predictions, db_paths, timeout)
-        ex_perm, ex_perm_flags = execution_accuracy_permuted(
-            predictions, db_paths, timeout
-        )
+        cache = _build_exec_cache(predictions, db_paths, timeout)
+
+        ex, ex_flags = execution_accuracy(predictions, cache)
+        ex_perm, ex_perm_flags = execution_accuracy_permuted(predictions, cache)
         em, em_flags = exact_match(predictions)
-        vsr, vsr_flags = valid_sql_rate(predictions, db_paths, timeout)
+        vsr, vsr_flags = valid_sql_rate(predictions, cache)
 
         result = {
             "ex_permuted": ex_perm,
@@ -336,7 +375,7 @@ def compute_all_metrics(
 
         if spider_tables_json:
             result["spider_official"] = compute_spider_component_metrics(
-                predictions, db_paths, spider_tables_json
+                predictions, db_paths, spider_tables_json, cache
             )
 
         return result

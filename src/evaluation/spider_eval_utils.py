@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 
 from src.evaluation.logging_utils import log_metric_error
 from src.evaluation.spider_process_sql import TABLE_TYPE
@@ -458,47 +457,53 @@ class Evaluator:
         return res
 
 
-def eval_exec_match(db, p_str, g_str, pred, gold):
-    with sqlite3.connect(db) as conn:
-        cursor = conn.cursor()
-        try:
-            cursor.execute(p_str)
-            p_res = cursor.fetchall()
-        except Exception as e:
-            log_metric_error(
-                "exec_match_pred_sql_failed | db=%s | error=%s | sql=%s",
-                db,
-                e,
-                p_str,
-            )
-            return False
+def _res_map(res, val_units):
+    rmap = {}
+    for idx, val_unit in enumerate(val_units):
+        key = (
+            tuple(val_unit[1])
+            if not val_unit[2]
+            else (val_unit[0], tuple(val_unit[1]), tuple(val_unit[2]))
+        )
+        rmap[key] = [r[idx] for r in res]
+    return rmap
 
-        try:
-            cursor.execute(g_str)
-            q_res = cursor.fetchall()
-        except Exception as e:
-            log_metric_error(
-                "exec_match_gold_sql_failed | db=%s | error=%s | sql=%s",
-                db,
-                e,
-                g_str,
-            )
-            return False
 
-    def res_map(res, val_units):
-        rmap = {}
-        for idx, val_unit in enumerate(val_units):
-            key = (
-                tuple(val_unit[1])
-                if not val_unit[2]
-                else (val_unit[0], tuple(val_unit[1]), tuple(val_unit[2]))
-            )
-            rmap[key] = [r[idx] for r in res]
-        return rmap
-
+def eval_exec_match_from_rows(p_res, g_res, pred, gold):
+    if p_res is None or g_res is None:
+        return False
     p_val_units = [unit[1] for unit in pred["select"][1]]
     q_val_units = [unit[1] for unit in gold["select"][1]]
-    return res_map(p_res, p_val_units) == res_map(q_res, q_val_units)
+    try:
+        return _res_map(p_res, p_val_units) == _res_map(g_res, q_val_units)
+    except IndexError:
+        return False
+
+
+def eval_exec_match(db, p_str, g_str, pred, gold, timeout: float = 30.0):
+    from src.evaluation.sql_executor import execute_sql
+
+    p_res, p_err = execute_sql(db, p_str, timeout)
+    if p_err is not None:
+        log_metric_error(
+            "exec_match_pred_sql_failed | db=%s | error=%s | sql=%s",
+            db,
+            p_err,
+            p_str,
+        )
+        return False
+
+    g_res, g_err = execute_sql(db, g_str, timeout)
+    if g_err is not None:
+        log_metric_error(
+            "exec_match_gold_sql_failed | db=%s | error=%s | sql=%s",
+            db,
+            g_err,
+            g_str,
+        )
+        return False
+
+    return eval_exec_match_from_rows(p_res, g_res, pred, gold)
 
 
 def rebuild_cond_unit_val(cond_unit):

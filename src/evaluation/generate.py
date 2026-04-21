@@ -105,6 +105,8 @@ def setup_tokenizer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    tokenizer.padding_side = "left"
+
     tokenizer.add_special_tokens(
         {"additional_special_tokens": custom_tokens or CUSTOM_SPECIAL_TOKENS}
     )
@@ -155,6 +157,7 @@ def generate_predictions(
     num_beams: int = 1,
     seed: int = 42,
     strip_evidence: bool = False,
+    batch_size: int = 1,
 ) -> list[dict]:
     model.eval()
     torch.manual_seed(seed)
@@ -168,12 +171,14 @@ def generate_predictions(
         pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
     )
 
-    predictions = []
-    for i, ex in enumerate(records):
-        prompt = make_inference_prompt(ex, tokenizer)
+    predictions: list[dict] = []
+    for start in range(0, len(records), batch_size):
+        batch = records[start : start + batch_size]
+        prompts = [make_inference_prompt(ex, tokenizer) for ex in batch]
         inputs = tokenizer(
-            prompt,
+            prompts,
             return_tensors="pt",
+            padding=True,
             truncation=True,
             max_length=max_input_length,
         ).to(model.device)
@@ -181,19 +186,23 @@ def generate_predictions(
         with torch.no_grad():
             outputs = model.generate(**inputs, **generation_config)
 
-        decoded = tokenizer.decode(outputs[0], skip_special_tokens=False)
-        assistant_text = _extract_assistant_text(decoded)
-        predictions.append(
-            {
-                "example_id": ex.get("example_id", f"{i}"),
-                "source": ex.get("source", "unknown"),
-                "db_id": ex["db_id"],
-                "question": ex["question"],
-                "gold_sql": ex["sql"],
-                "predicted_evidence": extract_evidence(assistant_text),
-                "predicted_sql": extract_sql(decoded, strip_evidence=strip_evidence),
-            }
-        )
+        input_len = inputs["input_ids"].shape[1]
+        gen_tokens = outputs[:, input_len:]
+
+        for j, ex in enumerate(batch):
+            decoded = tokenizer.decode(gen_tokens[j], skip_special_tokens=False)
+            assistant_text = _extract_assistant_text(decoded)
+            predictions.append(
+                {
+                    "example_id": ex.get("example_id", f"{start + j}"),
+                    "source": ex.get("source", "unknown"),
+                    "db_id": ex["db_id"],
+                    "question": ex["question"],
+                    "gold_sql": ex["sql"],
+                    "predicted_evidence": extract_evidence(assistant_text),
+                    "predicted_sql": extract_sql(decoded, strip_evidence=strip_evidence),
+                }
+            )
 
     return predictions
 
@@ -286,6 +295,7 @@ def generate(
         num_beams=cfg.get("num_beams", 1),
         seed=cfg.get("seed", 42),
         strip_evidence=cfg.get("strip_evidence", False),
+        batch_size=cfg.get("batch_size", 1),
     )
 
     if "predictions_path" in cfg:
