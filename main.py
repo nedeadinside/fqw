@@ -63,6 +63,7 @@ def _build_train_cfg(
     )
     train_cfg["processed_data_dir"] = str(_resolve_processed_data_dir(effective_cfg))
     train_cfg["checkpoint_dir"] = str(experiment_paths.checkpoints_dir)
+    train_cfg["logging_dir"] = str(experiment_paths.logs_dir)
 
     return train_cfg
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +11,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch
 import yaml
 from peft import get_peft_model, prepare_model_for_kbit_training
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import SFTConfig, SFTTrainer
 
 from src.data.dataset import CUSTOM_SPECIAL_TOKENS, load_splits
@@ -161,6 +163,29 @@ class CompletionOnlyDataCollator:
         return batch
 
 
+class JsonlTrainLogCallback(TrainerCallback):
+    def __init__(self, log_path: Path):
+        self.log_path = log_path
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.log_path.write_text("", encoding="utf-8")
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs:
+            return control
+
+        payload = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "step": int(state.global_step),
+            "epoch": None if state.epoch is None else float(state.epoch),
+        }
+        payload.update(logs)
+
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+        return control
+
+
 def train(
     config_path: str | None = None,
     chat_template_path: str | None = None,
@@ -218,6 +243,12 @@ def train(
         response_template=response_template,
     )
 
+    logging_dir_raw = cfg.get("logging_dir")
+    logging_dir = None
+    if logging_dir_raw:
+        logging_dir = _resolve_optional_path(str(logging_dir_raw))
+        logging_dir.mkdir(parents=True, exist_ok=True)
+
     bf16_flag = cfg.get("bf16", True)
     fp16_flag = not bf16_flag
 
@@ -251,7 +282,12 @@ def train(
         run_name=cfg.get("run_name", "nl2sql-main"),
         dataset_text_field="text",
         max_length=cfg.get("max_seq_length", 2048),
+        **({"logging_dir": str(logging_dir)} if logging_dir is not None else {}),
     )
+
+    callbacks = []
+    if logging_dir is not None:
+        callbacks.append(JsonlTrainLogCallback(logging_dir / "train_logs.jsonl"))
 
     trainer = SFTTrainer(
         model=model,
@@ -260,6 +296,7 @@ def train(
         eval_dataset=val_dataset,
         data_collator=collator,
         processing_class=tokenizer,
+        callbacks=callbacks,
     )
 
     trainer.train()
