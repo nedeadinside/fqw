@@ -26,8 +26,8 @@ logs
 old_runs
 meme
 wandb
-results_preds
 tea_debug.log
 .DS_Store
 Thumbs.db
 *.json
+artifacts

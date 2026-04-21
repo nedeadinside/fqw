@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-import os
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
+from src.evaluation.logging_utils import (
+    close_metrics_error_log,
+    configure_metrics_error_log,
+    log_metric_error,
+)
 from src.evaluation.spider_eval_utils import (
     Evaluator,
     build_foreign_key_map_from_json,
@@ -37,12 +42,32 @@ def _ex_with_matcher(
 ) -> Tuple[float, List[bool]]:
     correct_flags = []
     for pred in tqdm(predictions, desc=desc, unit="q"):
+        db_id = pred.get("db_id", "")
         db_path = db_paths.get(pred["db_id"], "")
         pred_result, pred_err = execute_sql(db_path, pred["predicted_sql"], timeout)
         gold_result, gold_err = execute_sql(db_path, pred["gold_sql"], timeout)
-        correct_flags.append(
+
+        if pred_err is not None:
+            log_metric_error(
+                "stage=%s | kind=pred_sql_exec_error | db_id=%s | error=%s | sql=%s",
+                desc,
+                db_id,
+                pred_err,
+                pred["predicted_sql"],
+            )
+        if gold_err is not None:
+            log_metric_error(
+                "stage=%s | kind=gold_sql_exec_error | db_id=%s | error=%s | sql=%s",
+                desc,
+                db_id,
+                gold_err,
+                pred["gold_sql"],
+            )
+
+        is_correct = (
             pred_err is None and gold_err is None and matcher(pred_result, gold_result)
         )
+        correct_flags.append(is_correct)
 
     score = sum(correct_flags) / len(correct_flags) if correct_flags else 0.0
     return score, correct_flags
@@ -84,8 +109,16 @@ def valid_sql_rate(
 ) -> Tuple[float, List[bool]]:
     valid_flags = []
     for pred in tqdm(predictions, desc="valid_sql_rate", unit="q"):
+        db_id = pred.get("db_id", "")
         db_path = db_paths.get(pred["db_id"], "")
         _, err = execute_sql(db_path, pred["predicted_sql"], timeout)
+        if err is not None:
+            log_metric_error(
+                "stage=valid_sql_rate | kind=pred_sql_exec_error | db_id=%s | error=%s | sql=%s",
+                db_id,
+                err,
+                pred["predicted_sql"],
+            )
         valid_flags.append(err is None)
 
     score = sum(valid_flags) / len(valid_flags) if valid_flags else 0.0
@@ -110,16 +143,41 @@ def _breakdown_by_source(
     }
 
 
+def _load_spider_fk_maps(tables_json: str) -> tuple[Dict[str, dict], List[str]]:
+    primary = Path(tables_json)
+    candidates = [primary]
+
+    # Spider test DB metadata is stored in a separate file.
+    test_tables = primary.with_name("test_tables.json")
+    if test_tables not in candidates and test_tables.exists():
+        candidates.append(test_tables)
+
+    kmaps: Dict[str, dict] = {}
+    loaded_files: List[str] = []
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        kmaps.update(build_foreign_key_map_from_json(str(candidate)))
+        loaded_files.append(str(candidate))
+
+    if not kmaps:
+        raise FileNotFoundError(
+            f"No Spider table metadata files found. Expected at least: {primary}"
+        )
+
+    return kmaps, loaded_files
+
+
 def compute_spider_component_metrics(
     predictions: List[dict],
-    db_dir: str,
+    db_paths: Dict[str, str],
     tables_json: str,
 ) -> dict:
     spider_preds = [p for p in predictions if p.get("source") == "spider"]
     if not spider_preds:
         return {}
 
-    kmaps = build_foreign_key_map_from_json(tables_json)
+    kmaps, loaded_table_files = _load_spider_fk_maps(tables_json)
 
     levels = ["easy", "medium", "hard", "extra", "all"]
     partial_types = [
@@ -150,7 +208,11 @@ def compute_spider_component_metrics(
     evaluator = Evaluator()
     for pred in tqdm(spider_preds, desc="spider_official", unit="q"):
         db_name = pred["db_id"]
-        db_path = os.path.join(db_dir, db_name, db_name + ".sqlite")
+        db_path = db_paths.get(db_name, "")
+        if not db_path:
+            raise FileNotFoundError(
+                f"SQLite file for db_id '{db_name}' was not found in configured database directories"
+            )
         schema = Schema(get_schema(db_path))
 
         g_sql = get_sql(schema, pred["gold_sql"])
@@ -160,7 +222,13 @@ def compute_spider_component_metrics(
 
         try:
             p_sql = get_sql(schema, pred["predicted_sql"])
-        except Exception:
+        except Exception as e:
+            log_metric_error(
+                "parse_pred_sql_failed | db_id=%s | error=%s | sql=%s",
+                db_name,
+                e,
+                pred["predicted_sql"],
+            )
             p_sql = {
                 "except": None,
                 "intersect": None,
@@ -174,7 +242,11 @@ def compute_spider_component_metrics(
                 "limit": None,
             }
 
-        kmap = kmaps[db_name]
+        kmap = kmaps.get(db_name)
+        if kmap is None:
+            raise KeyError(
+                f"db_id '{db_name}' is missing in tables metadata files: {loaded_table_files}"
+            )
         g_valid = build_valid_col_units(g_sql["from"]["table_units"], schema)
         g_sql = rebuild_sql_col(g_valid, rebuild_sql_val(g_sql), kmap)
         p_valid = build_valid_col_units(p_sql["from"]["table_units"], schema)
@@ -232,31 +304,41 @@ def compute_all_metrics(
     timeout: float = 30.0,
     spider_db_dir: Optional[str] = None,
     spider_tables_json: Optional[str] = None,
+    metrics_errors_log_path: Optional[str] = None,
 ) -> dict:
-    ex, ex_flags = execution_accuracy(predictions, db_paths, timeout)
-    ex_perm, ex_perm_flags = execution_accuracy_permuted(predictions, db_paths, timeout)
-    em, em_flags = exact_match(predictions)
-    vsr, vsr_flags = valid_sql_rate(predictions, db_paths, timeout)
-
-    result = {
-        "ex_permuted": ex_perm,
-        "ex_strict": ex,
-        "em": em,
-        "vsr": vsr,
-        "n_examples": len(predictions),
-        "n_correct_ex_permuted": sum(ex_perm_flags),
-        "n_correct_ex_strict": sum(ex_flags),
-        "by_source": {
-            "ex_permuted": _breakdown_by_source(predictions, ex_perm_flags),
-            "ex_strict": _breakdown_by_source(predictions, ex_flags),
-            "em": _breakdown_by_source(predictions, em_flags),
-            "vsr": _breakdown_by_source(predictions, vsr_flags),
-        },
-    }
-
-    if spider_db_dir and spider_tables_json:
-        result["spider_official"] = compute_spider_component_metrics(
-            predictions, spider_db_dir, spider_tables_json
+    configure_metrics_error_log(metrics_errors_log_path)
+    try:
+        ex, ex_flags = execution_accuracy(predictions, db_paths, timeout)
+        ex_perm, ex_perm_flags = execution_accuracy_permuted(
+            predictions, db_paths, timeout
         )
+        em, em_flags = exact_match(predictions)
+        vsr, vsr_flags = valid_sql_rate(predictions, db_paths, timeout)
 
-    return result
+        result = {
+            "ex_permuted": ex_perm,
+            "ex_strict": ex,
+            "em": em,
+            "vsr": vsr,
+            "n_examples": len(predictions),
+            "n_correct_ex_permuted": sum(ex_perm_flags),
+            "n_correct_ex_strict": sum(ex_flags),
+            "by_source": {
+                "ex_permuted": _breakdown_by_source(predictions, ex_perm_flags),
+                "ex_strict": _breakdown_by_source(predictions, ex_flags),
+                "em": _breakdown_by_source(predictions, em_flags),
+                "vsr": _breakdown_by_source(predictions, vsr_flags),
+            },
+        }
+
+        if metrics_errors_log_path:
+            result["metrics_errors_log_path"] = metrics_errors_log_path
+
+        if spider_tables_json:
+            result["spider_official"] = compute_spider_component_metrics(
+                predictions, db_paths, spider_tables_json
+            )
+
+        return result
+    finally:
+        close_metrics_error_log()

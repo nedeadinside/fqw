@@ -35,6 +35,15 @@ def _metrics_output_path(cfg: dict[str, Any], predictions_path: Path) -> Path:
     return results_dir / "metrics" / f"{stem}_metrics.json"
 
 
+def _metrics_errors_log_path(metrics_path: Path) -> Path:
+    experiment_dir = (
+        metrics_path.parent.parent
+        if metrics_path.parent.name == "metrics"
+        else metrics_path.parent
+    )
+    return experiment_dir / "logs" / f"{metrics_path.stem}_errors.log"
+
+
 def evaluate(
     config_path: str | None = None,
     cfg_override: dict[str, Any] | None = None,
@@ -54,6 +63,8 @@ def evaluate(
     if not predictions_path.exists():
         raise FileNotFoundError(f"Predictions not found: {cfg['predictions_path']}")
 
+    out_path = _metrics_output_path(cfg, predictions_path)
+
     predictions = load_jsonl(predictions_path)
 
     db_paths = build_db_path_index(
@@ -62,17 +73,25 @@ def evaluate(
         spider_test_db_dir=cfg["spider_test_db_dir"],
     )
 
+    metrics_errors_log_path_cfg = cfg.get("metrics_errors_log_path")
+    if metrics_errors_log_path_cfg:
+        metrics_errors_log_path = str(
+            resolve_optional_path(str(metrics_errors_log_path_cfg))
+        )
+    else:
+        metrics_errors_log_path = str(_metrics_errors_log_path(out_path))
+
     metrics = compute_all_metrics(
         predictions=predictions,
         db_paths=db_paths,
         timeout=cfg.get("execution_timeout", 30.0),
         spider_db_dir=cfg.get("spider_db_dir"),
         spider_tables_json=cfg.get("spider_tables_json"),
+        metrics_errors_log_path=metrics_errors_log_path,
     )
     metrics["predictions_path"] = str(predictions_path)
     metrics["n_predictions"] = len(predictions)
 
-    out_path = _metrics_output_path(cfg, predictions_path)
     _save_metrics(metrics, out_path)
     return metrics
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
+from src.evaluation.logging_utils import log_metric_error
 from src.evaluation.spider_process_sql import TABLE_TYPE
 
 WHERE_OPS = (
@@ -458,16 +459,31 @@ class Evaluator:
 
 
 def eval_exec_match(db, p_str, g_str, pred, gold):
-    conn = sqlite3.connect(db)
-    cursor = conn.cursor()
-    try:
-        cursor.execute(p_str)
-        p_res = cursor.fetchall()
-    except Exception as e:
-        print(e)
-        return False
-    cursor.execute(g_str)
-    q_res = cursor.fetchall()
+    with sqlite3.connect(db) as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(p_str)
+            p_res = cursor.fetchall()
+        except Exception as e:
+            log_metric_error(
+                "exec_match_pred_sql_failed | db=%s | error=%s | sql=%s",
+                db,
+                e,
+                p_str,
+            )
+            return False
+
+        try:
+            cursor.execute(g_str)
+            q_res = cursor.fetchall()
+        except Exception as e:
+            log_metric_error(
+                "exec_match_gold_sql_failed | db=%s | error=%s | sql=%s",
+                db,
+                e,
+                g_str,
+            )
+            return False
 
     def res_map(res, val_units):
         rmap = {}
