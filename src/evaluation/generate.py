@@ -20,7 +20,7 @@ from src.evaluation._config import (
 )
 
 ALLOWED_SPLITS = {"val", "test"}
-REQUIRED_CONFIG_KEYS = ("processed_data_dir",)
+REQUIRED_CONFIG_KEYS = ("processed_data_dir", "predictions_path")
 QWEN_TEMPLATE_MARKERS = (
     "<|im_start|>system",
     "<|im_start|>user",
@@ -229,7 +229,6 @@ def select_records(processed_data_dir: str | Path, split: str) -> list[dict]:
 
 def _resolve_model_path(
     cfg: dict[str, Any],
-    run_id: str,
     model_path_override: str | None,
 ) -> str:
     if model_path_override:
@@ -238,16 +237,7 @@ def _resolve_model_path(
         return str(resolve_optional_path(str(cfg["model_path"])))
     if "best_model_dir" in cfg:
         return str(resolve_optional_path(str(cfg["best_model_dir"])))
-    if "checkpoint_dir" in cfg:
-        candidate = Path(str(cfg["checkpoint_dir"])) / "best"
-        return str(resolve_optional_path(str(candidate)))
-    if "output_dir" in cfg:
-        root = Path(str(cfg["output_dir"]))
-        candidate = root / run_id / "best" if run_id else root / "best"
-        return str(resolve_optional_path(str(candidate)))
-    raise ValueError(
-        "Config must contain one of: model_path, best_model_dir, checkpoint_dir, output_dir"
-    )
+    raise ValueError("Config must contain one of: model_path, best_model_dir")
 
 
 def _save_predictions(predictions: list[dict], path: Path) -> None:
@@ -260,7 +250,6 @@ def _save_predictions(predictions: list[dict], path: Path) -> None:
 def generate(
     config_path: str | None = None,
     chat_template_path: str | None = None,
-    run_id: str = "E2",
     model_path_override: str | None = None,
     cfg_override: dict[str, Any] | None = None,
 ) -> Path:
@@ -281,7 +270,7 @@ def generate(
             f"Unsupported split: {split}. Allowed: {sorted(ALLOWED_SPLITS)}"
         )
 
-    model_path = _resolve_model_path(cfg, run_id, model_path_override)
+    model_path = _resolve_model_path(cfg, model_path_override)
     records = select_records(cfg["processed_data_dir"], split)
     custom_tokens = cfg.get("custom_special_tokens", CUSTOM_SPECIAL_TOKENS)
 
@@ -307,30 +296,6 @@ def generate(
         batch_size=cfg.get("batch_size", 1),
     )
 
-    if "predictions_path" in cfg:
-        out_path = Path(str(cfg["predictions_path"]))
-    else:
-        results_dir = Path(str(cfg.get("results_dir", "./results")))
-        filename = (
-            f"{run_id}_{split}_predictions.jsonl"
-            if run_id
-            else f"{split}_predictions.jsonl"
-        )
-        out_path = results_dir / "predictions" / filename
+    out_path = Path(str(cfg["predictions_path"]))
     _save_predictions(predictions, out_path)
     return out_path
-
-
-if __name__ == "__main__":
-    GENERATE_CONFIG_PATH = "configs/generate_qwen.yaml"
-    GENERATE_CHAT_TEMPLATE_PATH: str | None = "templates/qwen_chat_template.jinja"
-    GENERATE_RUN_ID = "E2"
-    GENERATE_MODEL_PATH: str | None = None
-
-    out = generate(
-        config_path=GENERATE_CONFIG_PATH,
-        chat_template_path=GENERATE_CHAT_TEMPLATE_PATH,
-        run_id=GENERATE_RUN_ID,
-        model_path_override=GENERATE_MODEL_PATH,
-    )
-    print(f"Predictions saved to: {out}")

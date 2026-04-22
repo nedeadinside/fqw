@@ -14,6 +14,7 @@ from src.evaluation.metrics import compute_all_metrics
 
 REQUIRED_CONFIG_KEYS = (
     "predictions_path",
+    "metrics_path",
     "spider_db_dir",
     "spider_test_db_dir",
 )
@@ -23,16 +24,6 @@ def _save_metrics(metrics: dict, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
-
-
-def _metrics_output_path(cfg: dict[str, Any], predictions_path: Path) -> Path:
-    if "metrics_path" in cfg:
-        return resolve_optional_path(str(cfg["metrics_path"]))
-    results_dir = resolve_optional_path(str(cfg.get("results_dir", "./results")))
-    stem = predictions_path.stem
-    if stem.endswith("_predictions"):
-        stem = stem[: -len("_predictions")]
-    return results_dir / "metrics" / f"{stem}_metrics.json"
 
 
 def _metrics_errors_log_path(metrics_path: Path) -> Path:
@@ -63,7 +54,7 @@ def evaluate(
     if not predictions_path.exists():
         raise FileNotFoundError(f"Predictions not found: {cfg['predictions_path']}")
 
-    out_path = _metrics_output_path(cfg, predictions_path)
+    out_path = resolve_optional_path(str(cfg["metrics_path"]))
 
     predictions = load_jsonl(predictions_path)
 
@@ -94,9 +85,3 @@ def evaluate(
 
     _save_metrics(metrics, out_path)
     return metrics
-
-
-if __name__ == "__main__":
-    EVAL_CONFIG_PATH = "configs/eval_qwen.yaml"
-    metrics = evaluate(config_path=EVAL_CONFIG_PATH)
-    print(json.dumps(metrics, ensure_ascii=False, indent=2))

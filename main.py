@@ -122,7 +122,6 @@ def _build_evaluate_cfg(
 
     evaluate_cfg["predictions_path"] = str(experiment_paths.prediction_path(split))
     evaluate_cfg["metrics_path"] = str(experiment_paths.metrics_path(split))
-    evaluate_cfg["results_dir"] = str(experiment_paths.root)
     evaluate_cfg["spider_db_dir"] = str(spider_db_dir)
     evaluate_cfg["spider_test_db_dir"] = str(spider_test_db_dir)
 
@@ -146,7 +145,6 @@ def _run_train_stage(
     best_checkpoint = Path(
         train(
             chat_template_path=chat_template_path,
-            run_id="",
             cfg_override=train_cfg,
         )
     )
@@ -188,7 +186,6 @@ def _run_generate_stage(
 
     predictions_path = generate(
         chat_template_path=chat_template_path,
-        run_id="",
         cfg_override=generate_cfg,
     )
 

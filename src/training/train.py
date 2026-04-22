@@ -48,17 +48,11 @@ def _resolve_config_path(
     raise FileNotFoundError(f"Train config not found: {config_path}")
 
 
-def _build_output_dir(cfg: dict[str, Any], run_id: str) -> Path:
+def _build_output_dir(cfg: dict[str, Any]) -> Path:
     checkpoint_dir = cfg.get("checkpoint_dir")
-    if checkpoint_dir:
-        return Path(str(checkpoint_dir))
-
-    output_root = cfg.get("output_dir")
-    if output_root is None:
-        raise ValueError("Train config requires 'checkpoint_dir' or 'output_dir'")
-
-    base = Path(str(output_root))
-    return base / run_id if run_id else base
+    if checkpoint_dir is None:
+        raise ValueError("Train config requires 'checkpoint_dir'")
+    return Path(str(checkpoint_dir))
 
 
 def _validate_qwen_template_tokens(template_text: str, template_path: Path) -> None:
@@ -189,7 +183,6 @@ class JsonlTrainLogCallback(TrainerCallback):
 def train(
     config_path: str | None = None,
     chat_template_path: str | None = None,
-    run_id: str = "E2",
     model_name_override: str | None = None,
     cfg_override: dict[str, Any] | None = None,
 ) -> str:
@@ -204,7 +197,7 @@ def train(
     lora_r = cfg.get("lora_r", 16)
     custom_tokens = cfg.get("custom_special_tokens", CUSTOM_SPECIAL_TOKENS)
 
-    output_dir = _build_output_dir(cfg, run_id)
+    output_dir = _build_output_dir(cfg)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     tokenizer = setup_tokenizer(
@@ -306,16 +299,3 @@ def train(
     tokenizer.save_pretrained(str(best_dir))
 
     return str(best_dir)
-
-
-if __name__ == "__main__":
-    TRAIN_CONFIG_PATH = "configs/train_qwen_2-5-3b.yaml"
-    TRAIN_CHAT_TEMPLATE_PATH: str | None = "templates/qwen_chat_template.jinja"
-    TRAIN_RUN_ID = "E2"
-
-    best_checkpoint = train(
-        config_path=TRAIN_CONFIG_PATH,
-        chat_template_path=TRAIN_CHAT_TEMPLATE_PATH,
-        run_id=TRAIN_RUN_ID,
-    )
-    print(best_checkpoint)

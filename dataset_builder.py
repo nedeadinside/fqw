@@ -1,8 +1,10 @@
+import io
 import json
 import sqlite3
+import sys
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -309,6 +311,169 @@ class SpiderDatasetBuilder(BaseDatasetBuilder):
         }
 
 
+class GretelDatasetBuilder(BaseDatasetBuilder):
+    def get_dataset_name(self) -> str:
+        return "gretel"
+
+    def get_db_path(self, db_id: str) -> Optional[Path]:
+        path = self.data_dir / "databases" / db_id / f"{db_id}.sqlite"
+        return path if path.exists() else None
+
+    def load_tables(self) -> None:
+        schemas_file = self.data_dir / "schemas.json"
+        if not schemas_file.exists():
+            return
+        with open(schemas_file, "r", encoding="utf-8") as f:
+            self.tables = json.load(f)
+
+    def load_queries(self, split: str) -> List[Dict[str, Any]]:
+        split_file = self.data_dir / f"{split}.jsonl"
+        if not split_file.exists():
+            raise FileNotFoundError(f"Split file not found: {split_file}")
+        queries = []
+        with open(split_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    queries.append(json.loads(line))
+        return queries
+
+    def _get_sql_field(self, example: Dict[str, Any]) -> str:
+        return example.get("sql", "")
+
+    def get_schema_ddl(self, db_id: str) -> str:
+        if db_id in self._schema_cache:
+            return self._schema_cache[db_id]
+
+        entry = self.tables.get(db_id, {})
+        ddl = entry.get("ddl", "")
+
+        if self.include_samples and ddl:
+            ddl = self._enrich_ddl_with_samples(db_id, ddl)
+
+        self._schema_cache[db_id] = ddl
+        return ddl
+
+    def _enrich_ddl_with_samples(self, db_id: str, ddl: str) -> str:
+        db_path = self._get_cached_db_path(db_id)
+        if db_path is None:
+            return ddl
+
+        try:
+            with self._get_db_connection(db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = [row[0] for row in cursor.fetchall()]
+        except Exception:
+            return ddl
+
+        sample_blocks: Dict[str, List[str]] = {}
+        for table_name in tables:
+            try:
+                with self._get_db_connection(db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(f'PRAGMA table_info("{table_name}")')
+                    columns = [row[1] for row in cursor.fetchall()]
+                lines = []
+                for col in columns:
+                    samples = self.get_sample_values(db_id, table_name, col)
+                    if samples:
+                        lines.append(f"- {col}: {', '.join(samples)}")
+                if lines:
+                    sample_blocks[table_name] = lines
+            except Exception:
+                continue
+
+        if not sample_blocks:
+            return ddl
+
+        enriched_statements = []
+        for stmt in ddl.split(";\n"):
+            stmt = stmt.strip().rstrip(";")
+            if not stmt:
+                continue
+            upper = stmt.upper().lstrip()
+            table_name = None
+            if upper.startswith("CREATE TABLE"):
+                for tname in sample_blocks:
+                    if tname.upper() in upper:
+                        table_name = tname
+                        break
+            result = stmt + ";"
+            if table_name and table_name in sample_blocks:
+                result += "\n" + "\n".join(sample_blocks[table_name])
+            enriched_statements.append(result)
+
+        return "\n".join(enriched_statements)
+
+    def _validate_sql(self, db_id: str, sql: str) -> bool:
+        db_path = self._get_cached_db_path(db_id)
+        if db_path is None:
+            return False
+        try:
+            with self._get_db_connection(db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(sql)
+            return True
+        except Exception:
+            return False
+
+    def build_record(
+        self, idx: int, example: Dict[str, Any], schema: str
+    ) -> Optional[Dict[str, Any]]:
+        raise NotImplementedError("GretelDatasetBuilder uses build_dataset directly")
+
+    def build_dataset(self, split: str, output_file: Optional[str] = None) -> str:
+        if not self.tables:
+            self.load_tables()
+
+        queries = self.load_queries(split)
+
+        if output_file is None:
+            output_file = self.output_dir / f"{split}.jsonl"
+
+        output_path = Path(output_file)
+        skip_invalid_sql = 0
+        skip_bad_evidence = 0
+
+        with open(output_path, "w", encoding="utf-8") as out_f:
+            for idx, example in enumerate(queries):
+                db_id = example.get("db_id")
+
+                if not self._validate_sql(db_id, example.get("sql", "")):
+                    skip_invalid_sql += 1
+                    continue
+
+                schema = self.get_schema_ddl(db_id)
+
+                buf = io.StringIO()
+                with redirect_stderr(buf):
+                    evidence = generate_evidence(example.get("sql", ""), example.get("sql_prompt", ""))
+                if buf.getvalue() or not evidence:
+                    skip_bad_evidence += 1
+                    continue
+
+                record = {
+                    "example_id": idx,
+                    "db_id": db_id,
+                    "question": example.get("sql_prompt", ""),
+                    "sql": example.get("sql", ""),
+                    "schema": schema,
+                    "evidence": evidence,
+                    "source": "gretel",
+                    "complexity": "unknown",
+                }
+                out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        total = len(queries)
+        print(
+            f"[gretel/{split}] total={total} | invalid_sql={skip_invalid_sql} | bad_evidence={skip_bad_evidence} | kept={total - skip_invalid_sql - skip_bad_evidence}",
+            file=sys.stderr,
+        )
+
+        return str(output_path)
+
+
 def build_all_datasets(
     data_root: str,
     output_dir: str,
@@ -320,7 +485,10 @@ def build_all_datasets(
 
     builders_config = [
         (data_root / "Spider", SpiderDatasetBuilder, ["train", "val", "test"]),
+        (data_root / "Gretel", GretelDatasetBuilder, ["train", "val", "test"]),
     ]
+
+    dataset_files: Dict[str, List[Path]] = defaultdict(list)
 
     for dataset_path, builder_class, splits in builders_config:
         if not dataset_path.exists():
@@ -329,11 +497,24 @@ def build_all_datasets(
         builder = builder_class(
             str(dataset_path), str(output_dir), include_samples, num_samples
         )
+        dataset_name = builder.get_dataset_name()
+
         for split in splits:
             try:
-                builder.build_dataset(split=split)
+                temp_file = output_dir / f"{dataset_name}_{split}.jsonl"
+                builder.build_dataset(split=split, output_file=str(temp_file))
+                dataset_files[split].append(temp_file)
             except (FileNotFoundError, ValueError):
                 continue
+
+    for split, files in dataset_files.items():
+        merged_path = output_dir / f"{split}.jsonl"
+        with open(merged_path, "w", encoding="utf-8") as out_f:
+            for file in files:
+                with open(file, "r", encoding="utf-8") as in_f:
+                    out_f.write(in_f.read())
+        for file in files:
+            file.unlink(missing_ok=True)
 
 
 def main():
