@@ -532,8 +532,16 @@ def build_all_datasets(
     output_dir = Path(output_dir)
 
     builders_config = [
-        (data_root / "Spider", SpiderDatasetBuilder, ["train", "val", "test"]),
-        (data_root / "Gretel", GretelDatasetBuilder, ["train", "val", "test"]),
+        (
+            data_root / "Spider",
+            SpiderDatasetBuilder,
+            {"train": "train", "val": "val", "test": "test"},
+        ),
+        (
+            data_root / "Gretel",
+            GretelDatasetBuilder,
+            {"train": "train", "val": "train"},
+        ),
     ]
 
     dataset_files: Dict[str, List[Path]] = defaultdict(list)
@@ -547,11 +555,11 @@ def build_all_datasets(
         )
         dataset_name = builder.get_dataset_name()
 
-        for split in splits:
+        for source_split, target_split in splits.items():
             try:
-                temp_file = output_dir / f"{dataset_name}_{split}.jsonl"
-                builder.build_dataset(split=split, output_file=str(temp_file))
-                dataset_files[split].append(temp_file)
+                temp_file = output_dir / f"{dataset_name}_{source_split}.jsonl"
+                builder.build_dataset(split=source_split, output_file=str(temp_file))
+                dataset_files[target_split].append(temp_file)
             except (FileNotFoundError, ValueError):
                 continue
 
