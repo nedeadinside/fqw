@@ -18,15 +18,18 @@ CUSTOM_SPECIAL_TOKENS = [
     "</question>",
     "<evidence>",
     "</evidence>",
+    "<sql>",
+    "</sql>",
 ]
 
 
 def format_example(example: dict, tokenizer) -> str:
     evidence = example.get("evidence", "")
+    sql_block = f"<sql>{example['sql']}</sql>"
     if evidence:
-        assistant_content = f"<evidence>\n{evidence}\n</evidence>\n\n{example['sql']}"
+        assistant_content = f"<evidence>{evidence}</evidence>{sql_block}"
     else:
-        assistant_content = example["sql"]
+        assistant_content = sql_block
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {

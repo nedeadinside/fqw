@@ -35,3 +35,5 @@ train:
     - "</schema>"
     - "<question>"
     - "</question>"
+    - "<sql>"
+    - "</sql>"

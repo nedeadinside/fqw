@@ -70,20 +70,10 @@ def extract_evidence(assistant_text: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-def extract_sql(generated_text: str, strip_evidence: bool = False) -> str:
-    sql = _extract_assistant_text(generated_text)
-
-    if strip_evidence:
-        sql = re.sub(r"<evidence>.*?</evidence>\s*", "", sql, flags=re.DOTALL).strip()
-
-    if sql.startswith("```"):
-        lines = sql.split("\n")
-        inner = lines[1:]
-        if inner and inner[-1].strip().startswith("```"):
-            inner = inner[:-1]
-        sql = "\n".join(inner).strip()
-
-    return sql
+def extract_sql(generated_text: str) -> str:
+    text = _extract_assistant_text(generated_text)
+    m = re.search(r"<sql>(.*?)</sql>", text, flags=re.DOTALL)
+    return m.group(1).strip() if m else ""
 
 
 def setup_tokenizer(
@@ -157,7 +147,6 @@ def generate_predictions(
     do_sample: bool = False,
     num_beams: int = 1,
     seed: int = 42,
-    strip_evidence: bool = False,
     batch_size: int = 1,
 ) -> list[dict]:
     model.eval()
@@ -207,9 +196,7 @@ def generate_predictions(
                     "question": ex["question"],
                     "gold_sql": ex["sql"],
                     "predicted_evidence": extract_evidence(assistant_text),
-                    "predicted_sql": extract_sql(
-                        decoded, strip_evidence=strip_evidence
-                    ),
+                    "predicted_sql": extract_sql(decoded),
                 }
             )
 
@@ -292,7 +279,6 @@ def generate(
         do_sample=cfg.get("do_sample", False),
         num_beams=cfg.get("num_beams", 1),
         seed=cfg.get("seed", 42),
-        strip_evidence=cfg.get("strip_evidence", False),
         batch_size=cfg.get("batch_size", 1),
     )
 
