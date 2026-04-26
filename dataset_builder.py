@@ -1,84 +1,14 @@
 import io
 import json
-import os
 import sqlite3
 import sys
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.data.evidence import generate_evidence
-
-
-def _iter_json_array(
-    path: Path, chunk_size: int = 1 << 20
-) -> Generator[Dict[str, Any], None, None]:
-    """Stream objects from a JSON array without loading the whole file in memory."""
-    decoder = json.JSONDecoder()
-    with open(path, "r", encoding="utf-8") as f:
-        buffer = ""
-        idx = 0
-        started = False
-        eof = False
-
-        while True:
-            if idx >= len(buffer) and not eof:
-                chunk = f.read(chunk_size)
-                if chunk:
-                    buffer += chunk
-                else:
-                    eof = True
-
-            while idx < len(buffer) and buffer[idx].isspace():
-                idx += 1
-
-            if not started:
-                if idx >= len(buffer):
-                    if eof:
-                        break
-                    continue
-                if buffer[idx] != "[":
-                    raise ValueError(f"Expected JSON array in {path}")
-                started = True
-                idx += 1
-                continue
-
-            while idx < len(buffer) and buffer[idx].isspace():
-                idx += 1
-
-            if idx >= len(buffer):
-                if eof:
-                    break
-                continue
-
-            if buffer[idx] == "]":
-                break
-
-            if buffer[idx] == ",":
-                idx += 1
-                continue
-
-            try:
-                value, next_idx = decoder.raw_decode(buffer, idx)
-            except json.JSONDecodeError:
-                if eof:
-                    raise
-                chunk = f.read(chunk_size)
-                if chunk:
-                    buffer += chunk
-                else:
-                    eof = True
-                continue
-
-            if isinstance(value, dict):
-                yield value
-
-            idx = next_idx
-            if idx > (1 << 20):
-                buffer = buffer[idx:]
-                idx = 0
 
 
 class BaseDatasetBuilder(ABC):
@@ -114,7 +44,6 @@ class BaseDatasetBuilder(ABC):
 
     @abstractmethod
     def get_db_path(self, db_id: str) -> Optional[Path]:
-        """Return the path to the SQLite database file for the given db_id."""
         raise NotImplementedError
 
     def get_sample_values(
@@ -184,7 +113,6 @@ class BaseDatasetBuilder(ABC):
 
     @contextmanager
     def _get_db_connection(self, db_path: Path):
-        """Context manager for database connections."""
         conn = sqlite3.connect(str(db_path))
         try:
             yield conn
@@ -192,7 +120,6 @@ class BaseDatasetBuilder(ABC):
             conn.close()
 
     def _get_cached_db_path(self, db_id: str) -> Optional[Path]:
-        """Get cached database path."""
         if db_id not in self._db_path_cache:
             self._db_path_cache[db_id] = self.get_db_path(db_id)
         return self._db_path_cache[db_id]
@@ -370,7 +297,6 @@ class SpiderDatasetBuilder(BaseDatasetBuilder):
         return "spider"
 
     def get_db_path(self, db_id: str) -> Optional[Path]:
-        """Return the path to the SQLite database file for Spider."""
         for rel_path in self.SPIDER_PATHS:
             db_path = self.data_dir / rel_path / db_id / f"{db_id}.sqlite"
             if db_path.exists():
@@ -596,229 +522,6 @@ class GretelDatasetBuilder(BaseDatasetBuilder):
         return str(output_path)
 
 
-class SynSQLDatasetBuilder(BaseDatasetBuilder):
-    _COMPLEXITY_LIMIT_MAP = {
-        "Simple": 10_000,
-        "Moderate": 10_000,
-        "Complex": 10_000,
-        "Highly Complex": 10_000,
-    }
-
-    def get_dataset_name(self) -> str:
-        return "synsql"
-
-    def load_tables(self) -> None:
-        self.tables = {}
-
-    def load_queries(self, split: str) -> List[Dict[str, Any]]:
-        return []
-
-    def _get_sql_field(self, example: Dict[str, Any]) -> str:
-        return example.get("sql", "")
-
-    def get_db_path(self, db_id: str) -> Optional[Path]:
-        candidates = [
-            self.data_dir / "databases" / db_id / f"{db_id}.sqlite",
-            self.data_dir / "databases" / f"{db_id}.sqlite",
-        ]
-        for path in candidates:
-            if path.exists():
-                return path
-        return None
-
-    def get_schema_ddl(self, db_id: str) -> str:
-        if db_id in self._schema_cache:
-            return self._schema_cache[db_id]
-
-        db_path = self._get_cached_db_path(db_id)
-        if db_path is None or not db_path.exists():
-            self._schema_cache[db_id] = ""
-            return ""
-
-        try:
-            with self._get_db_connection(db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-                )
-                tables = [row[0] for row in cursor.fetchall()]
-
-                ddl_statements: List[str] = []
-                for table_name in tables:
-                    cursor.execute(f'PRAGMA table_info("{table_name}")')
-                    table_info = cursor.fetchall()
-                    if not table_info:
-                        continue
-
-                    cursor.execute(f'PRAGMA foreign_key_list("{table_name}")')
-                    fk_rows = cursor.fetchall()
-
-                    col_lines: List[str] = []
-                    col_comments: List[str] = []
-                    pk_cols: List[str] = []
-                    for row in table_info:
-                        col_name = row[1]
-                        col_type = (row[2] or "").strip() or "TEXT"
-                        col_lines.append(f"    `{col_name}` {col_type}")
-
-                        if self.include_samples:
-                            samples = self.get_sample_values(
-                                db_id, table_name, col_name
-                            )
-                            col_comments.append(
-                                f" -- example: {samples!r}" if samples else ""
-                            )
-                        else:
-                            col_comments.append("")
-
-                        if row[5]:
-                            pk_cols.append(f"`{col_name}`")
-
-                    fk_clauses: List[str] = [
-                        f"    FOREIGN KEY (`{fk[3]}`) REFERENCES `{fk[2]}` (`{fk[4]}`)"
-                        for fk in fk_rows
-                    ]
-
-                    trailing: List[str] = []
-                    if pk_cols:
-                        trailing.append(f"    PRIMARY KEY ({', '.join(pk_cols)})")
-                    trailing.extend(fk_clauses)
-
-                    total = len(col_lines) + len(trailing)
-                    rendered: List[str] = []
-                    for i, (line, comment) in enumerate(zip(col_lines, col_comments)):
-                        sep = "" if i == total - 1 else ","
-                        rendered.append(f"{line}{sep}{comment}")
-                    for j, line in enumerate(trailing):
-                        sep = "" if len(col_lines) + j == total - 1 else ","
-                        rendered.append(f"{line}{sep}")
-
-                    body = "\n".join(rendered)
-                    ddl_statements.append(f"CREATE TABLE {table_name} (\n{body}\n);")
-
-                schema = "\n\n".join(ddl_statements)
-                self._schema_cache[db_id] = schema
-                return schema
-        except Exception:
-            self._schema_cache[db_id] = ""
-            return ""
-
-    @staticmethod
-    def _merge_question(example: Dict[str, Any]) -> str:
-        question = (example.get("question") or "").strip()
-        external_knowledge = (example.get("external_knowledge") or "").strip()
-        if question and external_knowledge:
-            return f"{question}\n{external_knowledge}"
-        return question or external_knowledge
-
-    def build_record(
-        self, idx: int, example: Dict[str, Any], schema: str
-    ) -> Dict[str, Any]:
-        return {
-            "example_id": idx,
-            "db_id": example.get("db_id"),
-            "question": self._merge_question(example),
-            "sql": example.get("sql", ""),
-            "schema": schema,
-            "evidence": example.get("evidence", ""),
-            "source": "synsql",
-            "complexity": example.get("sql_complexity", "unknown"),
-        }
-
-    def _complexity_limit_reached(
-        self, counts: Dict[str, int], complexity: str
-    ) -> bool:
-        limit = self._COMPLEXITY_LIMIT_MAP.get(complexity)
-        if limit is None:
-            return False
-        return counts.get(complexity, 0) >= limit
-
-    def _all_limits_reached(self, counts: Dict[str, int]) -> bool:
-        return all(
-            counts.get(complexity, 0) >= limit
-            for complexity, limit in self._COMPLEXITY_LIMIT_MAP.items()
-        )
-
-    def build_dataset(self, split: str, output_file: Optional[str] = None) -> str:
-        if split != "train":
-            raise ValueError("SynSQL supports train-only ingestion in this pipeline")
-
-        data_file = self.data_dir / "data.json"
-        if not data_file.exists():
-            raise FileNotFoundError(f"SynSQL data file not found: {data_file}")
-
-        if output_file is None:
-            output_file = self.output_dir / f"{split}.jsonl"
-        output_path = Path(output_file)
-
-        max_rows_env = os.getenv("SYNSQL_MAX_ROWS", "").strip()
-        max_rows = int(max_rows_env) if max_rows_env.isdigit() else None
-
-        complexity_counts: Dict[str, int] = {}
-        skipped_missing_fields = 0
-        skipped_bad_evidence = 0
-        skipped_complexity_limit = 0
-        total = 0
-
-        with open(output_path, "w", encoding="utf-8") as out_f:
-            for idx, example in enumerate(_iter_json_array(data_file)):
-                if max_rows is not None and total >= max_rows:
-                    break
-                if self._all_limits_reached(complexity_counts):
-                    break
-
-                total += 1
-
-                db_id = example.get("db_id")
-                sql = example.get("sql")
-                if not db_id or not sql:
-                    skipped_missing_fields += 1
-                    continue
-
-                complexity = example.get("sql_complexity", "unknown")
-                if self._complexity_limit_reached(complexity_counts, complexity):
-                    skipped_complexity_limit += 1
-                    continue
-
-                merged_question = self._merge_question(example)
-
-                buf = io.StringIO()
-                with redirect_stderr(buf):
-                    try:
-                        evidence = generate_evidence(sql, merged_question)
-                    except Exception:
-                        evidence = ""
-                if buf.getvalue() or not evidence:
-                    skipped_bad_evidence += 1
-                    continue
-
-                complexity_counts[complexity] = complexity_counts.get(complexity, 0) + 1
-
-                schema = self.get_schema_ddl(db_id)
-                tmp = {
-                    **example,
-                    "question": merged_question,
-                    "external_knowledge": "",
-                    "evidence": evidence,
-                }
-                record = self.build_record(idx, tmp, schema)
-                out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-        kept = (
-            total
-            - skipped_missing_fields
-            - skipped_bad_evidence
-            - skipped_complexity_limit
-        )
-        print(
-            f"[synsql/train] total={total} | skipped_missing_fields={skipped_missing_fields} | "
-            f"bad_evidence={skipped_bad_evidence} | skipped_complexity_limit={skipped_complexity_limit} | "
-            f"kept={kept} | complexity_counts={complexity_counts}",
-            file=sys.stderr,
-        )
-        return str(output_path)
-
-
 def build_all_datasets(
     data_root: str,
     output_dir: str,
@@ -831,7 +534,6 @@ def build_all_datasets(
     builders_config = [
         (data_root / "Spider", SpiderDatasetBuilder, ["train", "val", "test"]),
         (data_root / "Gretel", GretelDatasetBuilder, ["train", "val", "test"]),
-        (data_root / "SynSQL", SynSQLDatasetBuilder, ["train"]),
     ]
 
     dataset_files: Dict[str, List[Path]] = defaultdict(list)
