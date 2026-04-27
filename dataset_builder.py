@@ -26,8 +26,7 @@ class BaseDatasetBuilder(ABC):
         self.include_samples = include_samples
         self.num_samples = num_samples
         self._schema_cache: Dict[str, str] = {}
-        self._sample_cache: Dict[Tuple[str, str, str], List[Any]] = {}
-        self._column_types_cache: Dict[str, Dict[Tuple[str, str], str]] = {}
+        self._sample_cache: Dict[Tuple[str, str, str], List[str]] = {}
         self._db_path_cache: Dict[str, Optional[Path]] = {}
 
     @abstractmethod
@@ -48,7 +47,7 @@ class BaseDatasetBuilder(ABC):
 
     def get_sample_values(
         self, db_id: str, table_name: str, column_name: str
-    ) -> List[Any]:
+    ) -> List[str]:
         cache_key = (db_id, table_name, column_name)
         if cache_key in self._sample_cache:
             return self._sample_cache[cache_key]
@@ -66,50 +65,15 @@ class BaseDatasetBuilder(ABC):
                 cursor.execute(query)
                 rows = cursor.fetchall()
 
-            samples: List[Any] = []
-            for row in rows:
-                v = row[0]
-                if v is None:
-                    continue
-                if isinstance(v, bytes):
-                    try:
-                        v = v.decode("utf-8", errors="replace")
-                    except Exception:
-                        v = str(v)
-                if isinstance(v, str) and len(v) > 50:
-                    v = v[:47] + "..."
-                samples.append(v)
+            samples = [
+                (lambda s: s[:47] + "..." if len(s) > 50 else s)(str(row[0]))
+                for row in rows
+                if row[0] is not None
+            ]
             self._sample_cache[cache_key] = samples
             return samples
         except Exception:
             return []
-
-    def _get_column_sql_types(self, db_id: str) -> Dict[Tuple[str, str], str]:
-        if db_id in self._column_types_cache:
-            return self._column_types_cache[db_id]
-
-        result: Dict[Tuple[str, str], str] = {}
-        db_path = self._get_cached_db_path(db_id)
-        if db_path is None or not db_path.exists():
-            self._column_types_cache[db_id] = result
-            return result
-
-        try:
-            with self._get_db_connection(db_path) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-                tables = [row[0] for row in cursor.fetchall()]
-                for table_name in tables:
-                    cursor.execute(f'PRAGMA table_info("{table_name}")')
-                    for row in cursor.fetchall():
-                        col_name = row[1]
-                        col_type = (row[2] or "").strip() or "TEXT"
-                        result[(table_name, col_name)] = col_type
-        except Exception:
-            pass
-
-        self._column_types_cache[db_id] = result
-        return result
 
     @contextmanager
     def _get_db_connection(self, db_path: Path):
@@ -163,59 +127,44 @@ class BaseDatasetBuilder(ABC):
                 fk_ref = fk_map.get(col_idx)
                 table_columns[table_id].append((col_name, col_type, is_pk, fk_ref))
 
-        real_types = self._get_column_sql_types(db_id)
-
         ddl_statements = []
         for table_id, table_name in enumerate(table_names_original):
             columns = table_columns.get(table_id, [])
             if not columns:
                 continue
 
-            col_lines: List[str] = []
-            col_comments: List[str] = []
-            pk_cols: List[str] = []
-            fk_clauses: List[str] = []
+            col_definitions = []
+            fk_definitions = []
+            sample_comments = []
 
-            for col_name, spider_type, is_pk, fk_ref in columns:
-                sql_type = real_types.get(
-                    (table_name, col_name), (spider_type or "TEXT").upper()
-                )
-                col_lines.append(f"    `{col_name}` {sql_type}")
-                if self.include_samples:
-                    samples = self.get_sample_values(db_id, table_name, col_name)
-                    col_comments.append(f" -- example: {samples!r}" if samples else "")
-                else:
-                    col_comments.append("")
-
+            for col_name, col_type, is_pk, fk_ref in columns:
+                col_def = f"{col_name} {col_type.upper()}"
                 if is_pk:
-                    pk_cols.append(f"`{col_name}`")
+                    col_def += " PRIMARY KEY"
+                col_definitions.append(col_def)
+
                 if fk_ref:
                     ref_table, ref_col = fk_ref
-                    fk_clauses.append(
-                        f"    FOREIGN KEY (`{col_name}`) REFERENCES `{ref_table}` (`{ref_col}`)"
+                    fk_definitions.append(
+                        f"FOREIGN KEY ({col_name}) REFERENCES {ref_table}({ref_col})"
                     )
 
-            trailing: List[str] = []
-            if pk_cols:
-                trailing.append(f"    PRIMARY KEY ({', '.join(pk_cols)})")
-            trailing.extend(fk_clauses)
+                if self.include_samples:
+                    samples = self.get_sample_values(db_id, table_name, col_name)
+                    if samples:
+                        samples_str = ", ".join(f"{s}" for s in samples)
+                        sample_comments.append(f"- {col_name}: {samples_str}")
 
-            n_cols = len(col_lines)
-            total = n_cols + len(trailing)
-            rendered: List[str] = []
-            for i, (line, comment) in enumerate(zip(col_lines, col_comments)):
-                is_last = i == total - 1
-                sep = "" if is_last else ","
-                rendered.append(f"{line}{sep}{comment}")
-            for j, line in enumerate(trailing):
-                is_last = n_cols + j == total - 1
-                sep = "" if is_last else ","
-                rendered.append(f"{line}{sep}")
+            all_definitions = col_definitions + fk_definitions
+            columns_str = ", ".join(all_definitions)
+            ddl = f"CREATE TABLE {table_name} ({columns_str});"
 
-            body = "\n".join(rendered)
-            ddl_statements.append(f"CREATE TABLE {table_name} (\n{body}\n);")
+            if sample_comments:
+                ddl += "\n" + "\n".join(sample_comments)
 
-        result = "\n\n".join(ddl_statements)
+            ddl_statements.append(ddl)
+
+        result = "\n".join(ddl_statements)
         self._schema_cache[db_id] = result
         return result
 
@@ -540,7 +489,7 @@ def build_all_datasets(
         (
             data_root / "Gretel",
             GretelDatasetBuilder,
-            {"train": "train", "val": "train"},
+            {"train": "train", "val": "val"},
         ),
     ]
 
